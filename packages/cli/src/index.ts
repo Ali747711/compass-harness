@@ -3,10 +3,16 @@ import { SessionID } from "@compass/schema"
 import { layerDefault } from "@compass/core/database/database"
 import { SessionRun, layer as runLayer } from "@compass/core/session/run"
 import { SessionStore, layer as storeLayer } from "@compass/core/session/store"
+import { builtins } from "@compass/core/tool/builtins"
+import { layer as registryLayer } from "@compass/core/tool/registry"
 import { Effect, Layer } from "effect"
 import { parseArgs } from "node:util"
 
-const MainLayer = runLayer.pipe(Layer.provideMerge(storeLayer), Layer.provideMerge(layerDefault))
+const MainLayer = runLayer.pipe(
+  Layer.provideMerge(storeLayer),
+  Layer.provideMerge(registryLayer(builtins)),
+  Layer.provideMerge(layerDefault),
+)
 
 const { values, positionals } = parseArgs({
   args: Bun.argv.slice(2),
@@ -62,7 +68,15 @@ const program = Effect.gen(function* () {
     sessionID: session.id,
     text,
     ...(values.model === undefined ? {} : { model: values.model }),
-    sink: { text: (delta) => process.stdout.write(delta) },
+    sink: {
+      text: (delta) => process.stdout.write(delta),
+      // Tool activity goes to stderr so piping stdout still yields clean model text.
+      tool: (event) => {
+        if (event.state === "running") return process.stderr.write(`\n  ⋯ ${event.name}\n`)
+        const mark = event.state === "error" ? "✗" : "✓"
+        process.stderr.write(`  ${mark} ${event.name}${event.title ? ` — ${event.title}` : ""}\n`)
+      },
+    },
   })
   process.stdout.write("\n")
 })
