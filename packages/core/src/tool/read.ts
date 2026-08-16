@@ -5,16 +5,21 @@
 // (this harness has no attachment channel yet, so those refuse instead), and
 // `offset` is a 0-based line index rather than 1-indexed.
 
-import { Effect, Either, Schema } from "effect"
+import { Effect, Result, Schema } from "effect"
 import { readdir, stat } from "node:fs/promises"
-import { basename, dirname, extname, isAbsolute, join, relative, resolve } from "node:path"
-import { ToolFailure, make } from "./tool"
+import { basename, dirname, extname, isAbsolute, join, relative } from "node:path"
+import { resolveWithin } from "./path-guard"
+import { ToolFailure, make, type Context } from "./tool"
 
 const DEFAULT_LIMIT = 2000
 const MAX_LINE_WIDTH = 2000
 const LINE_CUT = `... (line truncated at ${MAX_LINE_WIDTH} characters)`
 const SAMPLE_BYTES = 4096
 const SUGGESTION_LIMIT = 3
+/** Names shorter than this carry too little signal to suggest anything from. */
+const MIN_SUGGESTION_LENGTH = 3
+/** Normalized edit distance a name must clear before it is offered as a near-miss. */
+const SIMILARITY_THRESHOLD = 0.6
 // Above this share of control bytes in the sample, the file is not text worth showing.
 const NON_PRINTABLE_RATIO = 0.3
 
@@ -31,23 +36,22 @@ Usage:
 - Call this tool in parallel when you already know several files you want to read.
 - Read a file before editing it. Editing contents you have not seen is a guess.
 - Text only. Directories, images, PDFs, archives, and other binary files are refused.
+- A path outside the session's working directory needs permission first.
 - A path that does not exist is an error, and names similar files in the same directory when it can. Use glob when you are unsure of a path.`
 
 const Input = Schema.Struct({
-  filePath: Schema.String.annotations({
+  filePath: Schema.String.annotate({
     description: "Path to the file to read. Absolute, or relative to the session's working directory.",
   }),
-  offset: Schema.optional(
-    Schema.Number.pipe(Schema.int(), Schema.greaterThanOrEqualTo(0)).annotations({ title: "offset" }),
-  ).annotations({
+  offset: Schema.optionalKey(Schema.Number.check(Schema.isInt(), Schema.isGreaterThanOrEqualTo(0))).annotate({
     description: "0-based line index to start reading from. Line 1 of the file is offset 0. Defaults to 0.",
   }),
-  limit: Schema.optional(
-    Schema.Number.pipe(Schema.int(), Schema.positive()).annotations({ title: "limit" }),
-  ).annotations({ description: `Maximum number of lines to return. Defaults to ${DEFAULT_LIMIT}.` }),
+  limit: Schema.optionalKey(Schema.Number.check(Schema.isInt(), Schema.isGreaterThan(0))).annotate({
+    description: `Maximum number of lines to return. Defaults to ${DEFAULT_LIMIT}.`,
+  }),
 })
 
-type Input = Schema.Schema.Type<typeof Input>
+type Input = typeof Input.Type
 
 const IMAGE_EXTENSIONS = new Set([
   ".png",
@@ -107,6 +111,15 @@ const errnoCode = (cause: unknown) => {
   return typeof code === "string" ? code : undefined
 }
 
+const cancelled = (filePath: string) => new ToolFailure({ message: `Read of ${filePath} was cancelled.` })
+
+/**
+ * Cancellation is re-checked between awaits rather than once at entry: a read
+ * that is abandoned mid-stream should stop at the next boundary, not finish.
+ */
+const checkpoint = (context: Context, filePath: string) =>
+  Effect.suspend(() => (context.abort.aborted ? Effect.fail(cancelled(filePath)) : Effect.void))
+
 /** Short label for the TUI: relative to the session directory when the file lives under it. */
 const label = (filePath: string, directory: string) => {
   const rel = relative(directory, filePath)
@@ -128,41 +141,100 @@ const stem = (name: string) => {
   return (extension === "" ? name : name.slice(0, -extension.length)).toLowerCase()
 }
 
-/**
- * Whole-name containment misses the common near-misses (`config.json` for
- * `configuration.json`, `read.txt` for `read.ts`), so stems are compared too.
- */
-const similar = (base: string, entry: string) => {
-  const a = base.toLowerCase()
-  const b = entry.toLowerCase()
-  if (a.includes(b) || b.includes(a)) return true
-  const left = stem(base)
-  const right = stem(entry)
-  return left !== "" && right !== "" && (left.includes(right) || right.includes(left))
+/** Levenshtein distance over code points. Filenames are short, so the full row scan is cheap. */
+const distance = (left: string, right: string) => {
+  const a = Array.from(left)
+  const b = Array.from(right)
+  if (a.length === 0) return b.length
+  if (b.length === 0) return a.length
+
+  let previous = Array.from({ length: b.length + 1 }, (_, index) => index)
+  for (let i = 1; i <= a.length; i += 1) {
+    const current = [i]
+    for (let j = 1; j <= b.length; j += 1) {
+      const substitution = (previous[j - 1] ?? 0) + (a[i - 1] === b[j - 1] ? 0 : 1)
+      const deletion = (previous[j] ?? 0) + 1
+      const insertion = (current[j - 1] ?? 0) + 1
+      current.push(Math.min(substitution, deletion, insertion))
+    }
+    previous = current
+  }
+  return previous[b.length] ?? 0
 }
 
-const missing = (filePath: string) =>
+/** 1 for identical, 0 for nothing in common. Containment scores as the length ratio. */
+const ratio = (left: string, right: string) => {
+  const longest = Math.max(Array.from(left).length, Array.from(right).length)
+  if (longest === 0) return 0
+  return 1 - distance(left, right) / longest
+}
+
+/**
+ * Whole-name distance under-scores near-misses that differ only in extension
+ * (`read.txt` for `read.ts`), so stems are scored too and the better one wins.
+ * Stems below the floor are ignored: a one-letter stem like `a.go` matches
+ * everything and would otherwise turn "did you mean" into a directory listing.
+ */
+const similarity = (base: string, entry: string) => {
+  const whole = ratio(base.toLowerCase(), entry.toLowerCase())
+  const left = stem(base)
+  const right = stem(entry)
+  if (left.length < MIN_SUGGESTION_LENGTH || right.length < MIN_SUGGESTION_LENGTH) return whole
+  return Math.max(whole, ratio(left, right))
+}
+
+const missing = (context: Context, filePath: string) =>
   Effect.gen(function* () {
     const directory = dirname(filePath)
     const base = basename(filePath)
+    const plain = new ToolFailure({ message: `File not found: ${filePath}` })
+    if (base.length < MIN_SUGGESTION_LENGTH) return yield* plain
+
     // An unreadable or missing parent directory just means no suggestions to offer.
     const entries = yield* Effect.promise(() => readdir(directory).catch((): readonly string[] => []))
-    const candidates = entries
-      .filter((entry) => similar(base, entry))
-      // Closest in length first, then alphabetical, so suggestions are ranked and stable.
-      .toSorted((a, b) => Math.abs(a.length - base.length) - Math.abs(b.length - base.length) || a.localeCompare(b))
-      .slice(0, SUGGESTION_LIMIT)
-      .map((entry) => join(directory, entry))
+    yield* checkpoint(context, filePath)
 
-    if (candidates.length === 0) return yield* new ToolFailure({ message: `File not found: ${filePath}` })
+    const ranked = entries
+      .filter((entry) => entry.length >= MIN_SUGGESTION_LENGTH)
+      .map((entry) => ({ entry, score: similarity(base, entry) }))
+      .filter((candidate) => candidate.score >= SIMILARITY_THRESHOLD)
+      // Closest score first, then closest in length, then alphabetical, so ranking is stable.
+      .toSorted(
+        (a, b) =>
+          b.score - a.score ||
+          Math.abs(a.entry.length - base.length) - Math.abs(b.entry.length - base.length) ||
+          a.entry.localeCompare(b.entry),
+      )
+
+    if (ranked.length === 0) return yield* plain
+
+    const shown = ranked.slice(0, SUGGESTION_LIMIT)
+    const omitted = ranked.length - shown.length
+    // Capping is stated rather than silent, so the absence of a name is never mistaken for its absence on disk.
+    const note = omitted === 0 ? "" : `\n(${omitted} further similar name${omitted === 1 ? "" : "s"} not shown.)`
     return yield* new ToolFailure({
-      message: `File not found: ${filePath}\n\nDid you mean one of these?\n${candidates.join("\n")}`,
+      message: `File not found: ${filePath}\n\nDid you mean one of these?\n${shown
+        .map((candidate) => join(directory, candidate.entry))
+        .join("\n")}${note}`,
     })
   })
 
 interface Page {
   readonly lines: readonly string[]
   readonly total: number
+}
+
+/**
+ * Cuts by code point, not UTF-16 unit: slicing mid-surrogate-pair emits a lone
+ * surrogate that survives all the way into the model's context as a replacement
+ * character.
+ */
+const clip = (line: string) => {
+  // A UTF-16 length within budget guarantees the code point count is too.
+  if (line.length <= MAX_LINE_WIDTH) return line
+  const points = Array.from(line)
+  if (points.length <= MAX_LINE_WIDTH) return line
+  return `${points.slice(0, MAX_LINE_WIDTH).join("")}${LINE_CUT}`
 }
 
 /**
@@ -181,7 +253,7 @@ const paginate = (filePath: string, offset: number, limit: number, abort: AbortS
         total += 1
         if (total <= offset || lines.length >= limit) return
         const line = raw.endsWith("\r") ? raw.slice(0, -1) : raw
-        lines.push(line.length > MAX_LINE_WIDTH ? `${line.slice(0, MAX_LINE_WIDTH)}${LINE_CUT}` : line)
+        lines.push(clip(line))
       }
 
       const decoder = new TextDecoder()
@@ -199,9 +271,9 @@ const paginate = (filePath: string, offset: number, limit: number, abort: AbortS
       return { lines, total } satisfies Page
     },
     catch: (cause) =>
-      new ToolFailure({
-        message: abort.aborted ? `Read of ${filePath} was cancelled.` : `Could not read ${filePath}: ${reason(cause)}`,
-      }),
+      abort.aborted
+        ? cancelled(filePath)
+        : new ToolFailure({ message: `Could not read ${filePath}: ${reason(cause)}` }),
   })
 
 const render = (filePath: string, body: string, footer: string) =>
@@ -212,19 +284,21 @@ export const readTool = make<Input>({
   input: Input,
   execute: (input, context) =>
     Effect.gen(function* () {
-      const filePath = isAbsolute(input.filePath) ? input.filePath : resolve(context.directory, input.filePath)
+      const filePath = yield* resolveWithin(context, input.filePath)
       const title = label(filePath, context.directory)
+      yield* checkpoint(context, filePath)
 
-      const stats = yield* Effect.tryPromise({ try: () => stat(filePath), catch: errnoCode }).pipe(Effect.either)
-      if (Either.isLeft(stats)) {
+      const stats = yield* Effect.tryPromise({ try: () => stat(filePath), catch: errnoCode }).pipe(Effect.result)
+      yield* checkpoint(context, filePath)
+      if (Result.isFailure(stats)) {
         // ENOTDIR means a parent component is a file, e.g. reading `notes.txt/inner`.
-        if (stats.left === "ENOENT" || stats.left === "ENOTDIR") return yield* missing(filePath)
+        if (stats.failure === "ENOENT" || stats.failure === "ENOTDIR") return yield* missing(context, filePath)
         return yield* new ToolFailure({
-          message: `Cannot access ${filePath}${stats.left === undefined ? "" : ` (${stats.left})`}.`,
+          message: `Cannot access ${filePath}${stats.failure === undefined ? "" : ` (${stats.failure})`}.`,
         })
       }
 
-      const info = stats.right
+      const info = stats.success
       if (info.isDirectory()) {
         return yield* new ToolFailure({
           message: `${filePath} is a directory, not a file. Read one of the files inside it, or use glob to list its contents.`,
@@ -234,14 +308,8 @@ export const readTool = make<Input>({
         return yield* new ToolFailure({ message: `${filePath} is not a regular file and cannot be read.` })
       }
 
-      if (info.size === 0) {
-        return {
-          title,
-          output: render(filePath, "", "(File is empty - 0 lines)"),
-          metadata: { path: filePath, totalLines: 0, empty: true },
-        }
-      }
-
+      // Format guards come before the empty-file shortcut: a zero-byte .png is still
+      // a .png, and reporting it as an empty text file invites the model to trust it.
       const extension = extname(filePath).toLowerCase()
       if (IMAGE_EXTENSIONS.has(extension)) {
         return yield* new ToolFailure({
@@ -254,10 +322,19 @@ export const readTool = make<Input>({
         })
       }
 
+      if (info.size === 0) {
+        return {
+          title,
+          output: render(filePath, "", "(File is empty - 0 lines)"),
+          metadata: { path: filePath, totalLines: 0, empty: true },
+        }
+      }
+
       const sample = yield* Effect.tryPromise({
         try: () => Bun.file(filePath).slice(0, SAMPLE_BYTES).bytes(),
         catch: (cause) => new ToolFailure({ message: `Could not read ${filePath}: ${reason(cause)}` }),
       })
+      yield* checkpoint(context, filePath)
       if (looksBinary(sample)) {
         return yield* new ToolFailure({
           message: `Cannot read ${filePath}: it contains binary data, not text. Use a shell command if you need to inspect it.`,
@@ -285,7 +362,11 @@ export const readTool = make<Input>({
       return {
         title,
         output: render(filePath, body, footer),
-        metadata: { path: filePath, lineStart: first, lineEnd: last, totalLines: page.total, truncated: more },
+        // Deliberately no delivered line range. The registry bounds `output` after
+        // this returns, so any exact range stated here could contradict what the
+        // model actually received; the footer inside `output` is the one claim
+        // about the window, and it travels with the text it describes.
+        metadata: { path: filePath, totalLines: page.total, requestedOffset: offset, requestedLimit: limit, more },
       }
     }),
 })

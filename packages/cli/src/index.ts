@@ -1,16 +1,23 @@
 #!/usr/bin/env bun
 import { SessionID } from "@compass/schema"
 import { layerDefault } from "@compass/core/database/database"
-import { SessionRun, layer as runLayer } from "@compass/core/session/run"
+import { SessionRun } from "@compass/core/session/run"
 import { SessionStore, layer as storeLayer } from "@compass/core/session/store"
-import { builtins } from "@compass/core/tool/builtins"
-import { layer as registryLayer } from "@compass/core/tool/registry"
+import { at, layer as locationsLayer } from "@compass/core/location/service-map"
+import { layerAllowAll } from "@compass/core/permission/permission"
+import { layer as projectLayer } from "@compass/core/project/project"
 import { Effect, Layer } from "effect"
 import { parseArgs } from "node:util"
 
-const MainLayer = runLayer.pipe(
+/**
+ * Global services are built once. The tool registry and session runner are
+ * Location-scoped and come from the service map, memoized per project, so one
+ * process can serve many directories.
+ */
+const MainLayer = locationsLayer.pipe(
+  Layer.provideMerge(projectLayer),
   Layer.provideMerge(storeLayer),
-  Layer.provideMerge(registryLayer(builtins)),
+  Layer.provideMerge(layerAllowAll),
   Layer.provideMerge(layerDefault),
 )
 
@@ -63,7 +70,8 @@ const program = Effect.gen(function* () {
 
   if (!values.session) process.stderr.write(`session ${session.id}\n\n`)
 
-  const run = yield* SessionRun
+  // The session's directory selects its Location.
+  const run = yield* Effect.provide(SessionRun, at({ directory: session.directory }))
   yield* run.prompt({
     sessionID: session.id,
     text,

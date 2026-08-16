@@ -27,10 +27,10 @@ export function open(path: string): Client {
   return { raw, db: drizzle(raw, { schema: tables }) }
 }
 
-export class Database extends Context.Tag("compass/Database")<Database, Client>() {}
+export class Database extends Context.Service<Database, Client>()("compass/Database") {}
 
 export const layer = (path: string) =>
-  Layer.scoped(
+  Layer.effect(
     Database,
     Effect.acquireRelease(
       Effect.sync(() => open(path)),
@@ -39,7 +39,7 @@ export const layer = (path: string) =>
   )
 
 /** Resolves the path lazily so COMPASS_DB can be set after module load. */
-export const layerDefault = Layer.unwrapEffect(Effect.sync(() => layer(defaultPath())))
+export const layerDefault = Layer.unwrap(Effect.sync(() => layer(defaultPath())))
 
 /** In-memory instance for tests. Prefer this over mocking the database. */
 export const layerMemory = layer(":memory:")

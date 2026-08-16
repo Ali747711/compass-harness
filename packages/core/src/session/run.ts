@@ -33,7 +33,7 @@ export interface Interface {
   readonly prompt: (input: RunInput) => Effect.Effect<void>
 }
 
-export class SessionRun extends Context.Tag("compass/SessionRun")<SessionRun, Interface>() {}
+export class SessionRun extends Context.Service<SessionRun, Interface>()("compass/SessionRun") {}
 
 /** Bounds runaway tool loops. M2 replaces this with a per-agent turn allowance. */
 const MAX_STEPS = 40
@@ -112,9 +112,9 @@ export const layer = Layer.effect(
         entry.name,
         aiTool({
           description: entry.tool.description,
-          // Effect's JsonSchema7Root and the AI SDK's JSONSchema7 are the same
-          // draft-7 document but nominally distinct types, so the cast is the
-          // impedance mismatch and not a loss of safety.
+          // Effect's JsonSchema document and the AI SDK's JSONSchema7 are the
+          // same draft-7 document but nominally distinct types, so the cast is
+          // the impedance mismatch and not a loss of safety.
           inputSchema: jsonSchema(parameters(entry.tool) as unknown as Parameters<typeof jsonSchema>[0]),
         }),
       ]),

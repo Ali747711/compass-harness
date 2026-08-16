@@ -1,9 +1,12 @@
 import { messageID, sessionID } from "@compass/schema"
 import { describe, expect, test } from "bun:test"
 import { Effect, Schema } from "effect"
-import { make as makeRegistry } from "../src/tool/registry"
+import { make as makeRegistryRaw } from "../src/tool/registry"
 import { MAX_LINES, bound } from "../src/tool/truncate"
 import { ToolFailure, make as makeTool, validName } from "../src/tool/tool"
+
+const allowAll = { ask: () => Effect.void }
+const makeRegistry = (regs: Parameters<typeof makeRegistryRaw>[0]) => makeRegistryRaw(regs, allowAll)
 
 const context = {
   sessionID: sessionID(),
@@ -145,11 +148,33 @@ describe("truncate.bound", () => {
     expect(result.content).toMatch(/90 lines truncated/)
   })
 
-  test("keeps the tail when asked, which is what shell output needs", () => {
+  test("keeps the tail as well as the head", () => {
     const text = Array.from({ length: 100 }, (_, i) => `line ${i}`).join("\n")
-    const result = bound(text, { maxLines: 10, direction: "tail" })
+    const result = bound(text, { maxLines: 10 })
     expect(result.truncated).toBe(true)
     expect(result.content.trimEnd().endsWith("line 99")).toBe(true)
+  })
+
+  /**
+   * The regression that motivated middle-out bounding. Tools put framing last —
+   * read's `Use offset=N to continue`, bash's exit code and stderr. Head-only
+   * clipping deleted it, so pagination silently broke and failed commands read
+   * to the model as clean successes.
+   */
+  test("preserves trailing framing a tool appended after its content", () => {
+    const body = Array.from({ length: 5000 }, (_, i) => `line ${i}`).join("\n")
+    const result = bound(`${body}\n\n(Showing lines 1-5000 of 90000. Use offset=5001 to continue.)`)
+    expect(result.truncated).toBe(true)
+    expect(result.content).toContain("Use offset=5001 to continue.")
+    expect(result.content).toContain("line 0")
+  })
+
+  test("splits the budget between head and tail", () => {
+    const text = Array.from({ length: 100 }, (_, i) => `line ${i}`).join("\n")
+    const result = bound(text, { maxLines: 20 })
+    expect(result.content).toContain("line 0")
+    expect(result.content).toContain("line 99")
+    expect(result.content).not.toContain("line 50")
   })
 
   test("bounds by bytes when the byte limit is reached first", () => {
@@ -165,5 +190,19 @@ describe("truncate.bound", () => {
     const text = Array.from({ length: 40 }, () => "日".repeat(50)).join("\n")
     const result = bound(text, { maxLines: 10_000, maxBytes: 300 })
     expect(result.truncated).toBe(true)
+  })
+
+  test("never splits a surrogate pair when cutting the tail by bytes", () => {
+    const text = `${"a".repeat(400)}\n${"🚀".repeat(400)}`
+    const result = bound(text, { maxLines: 10_000, maxBytes: 600 })
+    expect(result.truncated).toBe(true)
+    expect(/[\uD800-\uDBFF](?![\uDC00-\uDFFF])|(?<![\uD800-\uDBFF])[\uDC00-\uDFFF]/.test(result.content)).toBe(false)
+  })
+
+  test("degrades to the marker alone when the budget cannot fit content", () => {
+    const text = Array.from({ length: 100 }, (_, i) => `line ${i}`).join("\n")
+    const result = bound(text, { maxLines: 2 })
+    expect(result.truncated).toBe(true)
+    expect(result.content).toMatch(/truncated/)
   })
 })

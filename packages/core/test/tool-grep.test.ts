@@ -1,11 +1,12 @@
 import { messageID, sessionID } from "@compass/schema"
 import { afterAll, afterEach, beforeEach, describe, expect, test } from "bun:test"
-import { Effect, Either } from "effect"
-import { mkdirSync, mkdtempSync, rmSync, utimesSync, writeFileSync } from "node:fs"
+import { Effect, Result } from "effect"
+import { chmodSync, mkdirSync, mkdtempSync, rmSync, utimesSync, writeFileSync } from "node:fs"
 import { tmpdir } from "node:os"
 import { join } from "node:path"
+import { PermissionDenied, type Request as PermissionRequest } from "../src/permission/permission"
 import { grepTool } from "../src/tool/grep"
-import { decode, type Context, type Result, type ToolFailure } from "../src/tool/tool"
+import { decode, type Context, type Result as ToolResult, type ToolFailure } from "../src/tool/tool"
 
 const roots: string[] = []
 
@@ -21,12 +22,23 @@ const fixture = () => {
   return root
 }
 
-const context = (directory: string, signal?: AbortSignal): Context => ({
+/** A dependency inside node_modules: skipped by default, reachable when named. */
+const withDependency = (root: string) => {
+  mkdirSync(join(root, "node_modules", "dep"), { recursive: true })
+  const file = join(root, "node_modules", "dep", "index.js")
+  writeFileSync(file, "// TODO: dep\n")
+  return file
+}
+
+type Ask = Context["ask"]
+
+const context = (directory: string, signal?: AbortSignal, ask?: Ask): Context => ({
   sessionID: sessionID(),
   messageID: messageID(),
   callID: "call_grep",
   directory,
   abort: signal ?? new AbortController().signal,
+  ask: ask ?? (() => Effect.void),
 })
 
 interface Input {
@@ -36,23 +48,23 @@ interface Input {
   readonly limit?: number
 }
 
-const settle = (input: Input, directory: string, signal?: AbortSignal) =>
-  Effect.runPromise(grepTool.execute(input, context(directory, signal)).pipe(Effect.either))
+const settle = (input: Input, directory: string, signal?: AbortSignal, ask?: Ask) =>
+  Effect.runPromise(grepTool.execute(input, context(directory, signal, ask)).pipe(Effect.result))
 
-const succeed = async (input: Input, directory: string) => {
-  const result = await settle(input, directory)
-  if (Either.isLeft(result)) throw new Error(`expected success, got: ${result.left.message}`)
-  return result.right
+const succeed = async (input: Input, directory: string, ask?: Ask) => {
+  const result = await settle(input, directory, undefined, ask)
+  if (Result.isFailure(result)) throw new Error(`expected success, got: ${result.failure.message}`)
+  return result.success
 }
 
-const fail = async (input: Input, directory: string, signal?: AbortSignal) => {
-  const result = await settle(input, directory, signal)
-  if (Either.isRight(result)) throw new Error(`expected failure, got: ${result.right.output}`)
-  return result.left
+const fail = async (input: Input, directory: string, signal?: AbortSignal, ask?: Ask) => {
+  const result = await settle(input, directory, signal, ask)
+  if (Result.isSuccess(result)) throw new Error(`expected failure, got: ${result.success.output}`)
+  return result.failure
 }
 
 /** Distinct file paths in the order the output lists them. */
-const matchedFiles = (result: Result) => {
+const matchedFiles = (result: ToolResult) => {
   const paths = result.output
     .split("\n")
     .map((line) => /^(.+?):\d+:/.exec(line)?.[1])
@@ -66,6 +78,8 @@ afterAll(() => {
 
 const originalPath = process.env["PATH"] ?? ""
 const ripgrepInstalled = Bun.which("rg", { PATH: originalPath }) !== null
+// chmod 000 does not stop root, so the unreadable-file expectations only hold for a normal user.
+const privileged = process.getuid?.() === 0
 
 // Both engines are exercised against the same expectations. `PATH=""` makes the
 // binary lookup fail for real, which is the only thing that selects the fallback.
@@ -136,6 +150,11 @@ for (const engine of engines) {
       expect(result.output).not.toContain("alpha.ts")
     })
 
+    test("treats an empty path as the session directory", async () => {
+      const result = await succeed({ pattern: "TODO", path: "" }, fixture())
+      expect(result.metadata?.["matches"]).toBe(3)
+    })
+
     test("searches a single file when path points at one", async () => {
       const root = fixture()
       const result = await succeed({ pattern: "TODO", path: join(root, "sub", "gamma.txt") }, root)
@@ -157,6 +176,7 @@ for (const engine of engines) {
       const result = await succeed({ pattern: "definitely_not_present_anywhere" }, root)
 
       expect(result.metadata?.["matches"]).toBe(0)
+      expect(result.metadata?.["incomplete"]).toBe(false)
       expect(result.output).toContain("No matches found")
       expect(result.output).toContain(root)
     })
@@ -206,6 +226,67 @@ for (const engine of engines) {
       ])
     })
 
+    test("marks a long matched line with what it cut", async () => {
+      const root = fixture()
+      writeFileSync(join(root, "wide.txt"), `TODO_CLIP ${"a".repeat(3000)}\n`)
+      const result = await succeed({ pattern: "TODO_CLIP" }, root)
+
+      expect(result.metadata?.["matches"]).toBe(1)
+      expect(result.output).toContain("(line truncated at 2000 of 3010 characters)")
+    })
+
+    // Regression: the ripgrep engine dropped any JSON record over 64 KB, so a match on a
+    // minified line reported as "No matches found" — absence invented out of dropped data.
+    test("reports a match on a line too long to display instead of dropping it", async () => {
+      const root = fixture()
+      writeFileSync(join(root, "minified.js"), `${"x".repeat(100_000)}NEEDLE_LONG${"y".repeat(100_000)}\n`)
+      const result = await succeed({ pattern: "NEEDLE_LONG" }, root)
+
+      expect(result.metadata?.["matches"]).toBe(1)
+      expect(result.output).not.toContain("No matches found")
+      expect(result.output).toContain(
+        `${join(root, "minified.js")}:1:(match omitted: line too long to display; use read to inspect this file)`,
+      )
+    })
+
+    // Regression: the fallback read every file inside one Effect.tryPromise, so the first
+    // EACCES aborted the whole search; ripgrep hid the same files behind --no-messages.
+    test.skipIf(privileged)("keeps searching past an unreadable file and names it", async () => {
+      const root = fixture()
+      const secret = join(root, "secret.txt")
+      writeFileSync(secret, "TODO: secret\n")
+      chmodSync(secret, 0o000)
+
+      const result = await succeed({ pattern: "TODO" }, root)
+      chmodSync(secret, 0o644)
+
+      expect(result.metadata?.["matches"]).toBe(3)
+      expect(result.metadata?.["incomplete"]).toBe(true)
+      expect(result.output).toContain("secret.txt")
+      expect(result.output.toLowerCase()).toMatch(/could not be (read|searched)/)
+    })
+
+    // Regression: only the fallback skipped node_modules, so the engines disagreed.
+    test("skips node_modules by default in both engines", async () => {
+      const root = fixture()
+      withDependency(root)
+      const result = await succeed({ pattern: "TODO" }, root)
+
+      expect(result.metadata?.["matches"]).toBe(3)
+      expect(result.output).not.toContain("node_modules")
+    })
+
+    // Regression: the fallback's skip list was unconditional, so an include glob that
+    // named node_modules explicitly could never match anything.
+    test("searches a skipped directory when the include glob names it", async () => {
+      const root = fixture()
+      const dependency = withDependency(root)
+      const result = await succeed({ pattern: "TODO", include: "node_modules/**/*.js" }, root)
+
+      expect(result.metadata?.["matches"]).toBe(1)
+      expect(result.output).toContain(`${dependency}:1:// TODO: dep`)
+    })
+
     test("fails with the regex error for an invalid pattern", async () => {
       const error = await fail({ pattern: "[unclosed" }, fixture())
       expect(error._tag).toBe("ToolFailure")
@@ -228,19 +309,104 @@ for (const engine of engines) {
   })
 }
 
+// The 10 MB ceiling only exists in the built-in walk, which reads whole files.
+describe("grepTool (fallback file ceiling)", () => {
+  beforeEach(() => {
+    process.env["PATH"] = ""
+  })
+  afterEach(() => {
+    process.env["PATH"] = originalPath
+  })
+
+  test("reports the files it was too large to search", async () => {
+    const root = fixture()
+    writeFileSync(
+      join(root, "huge.log"),
+      Buffer.concat([Buffer.alloc(11 * 1024 * 1024, 0x61), Buffer.from("\nTODO: huge\n", "utf8")]),
+    )
+    const result = await succeed({ pattern: "TODO" }, root)
+
+    expect(result.metadata?.["matches"]).toBe(3)
+    expect(result.metadata?.["incomplete"]).toBe(true)
+    expect(result.output).toContain("huge.log")
+    expect(result.output).toContain("10 MB")
+  })
+
+  test("does not report absence when everything it would have searched was skipped", async () => {
+    const root = mkdtempSync(join(tmpdir(), "compass-grep-"))
+    roots.push(root)
+    writeFileSync(
+      join(root, "huge.log"),
+      Buffer.concat([Buffer.alloc(11 * 1024 * 1024, 0x61), Buffer.from("\nTODO: huge\n", "utf8")]),
+    )
+    const result = await succeed({ pattern: "TODO" }, root)
+
+    expect(result.metadata?.["matches"]).toBe(0)
+    expect(result.metadata?.["incomplete"]).toBe(true)
+    expect(result.output).toContain("the search was incomplete")
+    expect(result.output).toContain("huge.log")
+  })
+})
+
+describe("grepTool permission", () => {
+  test("asks for external_directory before searching outside the session directory", async () => {
+    const session = fixture()
+    const outside = fixture()
+    const asked: PermissionRequest[] = []
+
+    const result = await succeed({ pattern: "TODO: alpha", path: outside }, session, (request) =>
+      Effect.sync(() => {
+        asked.push(request)
+      }),
+    )
+
+    expect(asked.map((request) => request.permission)).toEqual(["external_directory"])
+    expect(result.output).toContain(join(outside, "alpha.ts"))
+  })
+
+  test("does not ask when the search stays inside the session directory", async () => {
+    const session = fixture()
+    const asked: PermissionRequest[] = []
+
+    await succeed({ pattern: "TODO" }, session, (request) =>
+      Effect.sync(() => {
+        asked.push(request)
+      }),
+    )
+
+    expect(asked).toEqual([])
+  })
+
+  test("fails without searching when the external directory is refused", async () => {
+    const session = fixture()
+    const outside = fixture()
+
+    const error = await fail(
+      { pattern: "TODO", path: outside },
+      session,
+      undefined,
+      () => new PermissionDenied({ permission: "external_directory", pattern: outside }),
+    )
+
+    expect(error._tag).toBe("ToolFailure")
+    expect(error.message).toContain("outside the session directory")
+    expect(error.message).toContain(outside)
+  })
+})
+
 describe("grepTool contract", () => {
-  const run = <A>(effect: Effect.Effect<A, ToolFailure>) => Effect.runPromise(effect.pipe(Effect.either))
+  const run = <A>(effect: Effect.Effect<A, ToolFailure>) => Effect.runPromise(effect.pipe(Effect.result))
 
   test("requires a pattern", async () => {
     const decoded = await run(decode(grepTool, { path: "." }))
-    expect(Either.isLeft(decoded)).toBe(true)
+    expect(Result.isFailure(decoded)).toBe(true)
   })
 
   test("rejects a limit outside the supported range", async () => {
-    expect(Either.isLeft(await run(decode(grepTool, { pattern: "x", limit: 0 })))).toBe(true)
-    expect(Either.isLeft(await run(decode(grepTool, { pattern: "x", limit: 1.5 })))).toBe(true)
-    expect(Either.isLeft(await run(decode(grepTool, { pattern: "x", limit: 5000 })))).toBe(true)
-    expect(Either.isRight(await run(decode(grepTool, { pattern: "x", limit: 25 })))).toBe(true)
+    expect(Result.isFailure(await run(decode(grepTool, { pattern: "x", limit: 0 })))).toBe(true)
+    expect(Result.isFailure(await run(decode(grepTool, { pattern: "x", limit: 1.5 })))).toBe(true)
+    expect(Result.isFailure(await run(decode(grepTool, { pattern: "x", limit: 5000 })))).toBe(true)
+    expect(Result.isSuccess(await run(decode(grepTool, { pattern: "x", limit: 25 })))).toBe(true)
   })
 
   test("documents every parameter for the model", () => {
