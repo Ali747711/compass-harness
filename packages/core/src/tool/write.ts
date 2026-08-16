@@ -97,8 +97,7 @@ export const writeTool = make({
       const existing = yield* inspect(filePath)
       if (existing?.isDirectory())
         return yield* new ToolFailure({
-          message:
-            `${filePath} is a directory, not a file. ` + `Choose a file path inside it, or remove the directory first.`,
+          message: `${filePath} is a directory, not a file. Choose a file path inside it, or remove the directory first.`,
         })
 
       yield* abortIf(context, "before its parent directory was created")
