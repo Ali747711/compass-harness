@@ -1,6 +1,7 @@
 import { Context as EffectContext, Effect, Layer, Result as EffectResult } from "effect"
 import { Permission, type Interface as PermissionService } from "../permission/permission"
-import { bound } from "./truncate"
+import { Spill } from "./spill"
+import { bound, exceeds } from "./truncate"
 import { decode, validName, type Context, type Result, type Tool } from "./tool"
 
 /**
@@ -58,11 +59,25 @@ export function make(registrations: readonly Registration[], permission: Permiss
 
         // Bounding is applied after a successful operation, never before it, so a
         // tool that succeeded is never reported as failed because it said too much.
-        const limited = bound(settled.success.output)
-        return {
-          ok: true as const,
-          result: limited.truncated ? { ...settled.success, output: limited.content } : settled.success,
-        }
+        const output = settled.success.output
+        if (!exceeds(output)) return { ok: true as const, result: settled.success }
+
+        // Spill first: the marker has to name the file, and writing is async
+        // while bounding is not. A failed write yields undefined rather than an
+        // error, because the tool already did its work.
+        const path = yield* Spill.write({
+          text: output,
+          directory: input.context.directory,
+          sessionID: input.context.sessionID,
+          callID: input.context.callID,
+        })
+        const limited = bound(output, {
+          note:
+            path === undefined
+              ? "The full output could not be saved, so the omitted text is lost. Narrow the request to see it."
+              : `Full output saved to ${path} — use the read tool with offset and limit to see the omitted text.`,
+        })
+        return { ok: true as const, result: { ...settled.success, output: limited.content } }
       }).pipe(
         Effect.catchDefect((defect) =>
           Effect.succeed({

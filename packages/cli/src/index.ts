@@ -4,6 +4,7 @@ import { layerDefault } from "@compass/core/database/database"
 import { SessionRun } from "@compass/core/session/run"
 import { SessionStore, layer as storeLayer } from "@compass/core/session/store"
 import { at, layer as locationsLayer } from "@compass/core/location/service-map"
+import { Spill } from "@compass/core/tool/spill"
 import { layerAllowAll } from "@compass/core/permission/permission"
 import { layer as projectLayer } from "@compass/core/project/project"
 import { Effect, Layer } from "effect"
@@ -87,6 +88,10 @@ const program = Effect.gen(function* () {
     },
   })
   process.stdout.write("\n")
+
+  // Retention sweep. There is no session-close lifecycle yet, so the age-based
+  // half of the cleanup rule runs here; it is a readdir over one small directory.
+  yield* Spill.sweep(session.directory).pipe(Effect.ignore)
 })
 
 await Effect.runPromise(program.pipe(Effect.provide(MainLayer), Effect.scoped)).catch((error) => {
