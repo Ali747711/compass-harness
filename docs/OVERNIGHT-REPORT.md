@@ -4,7 +4,7 @@
 
 - [x] 1. Tool-output truncation with file spill — `c92b2cf`
 - [x] 2. Compaction tier 1 (prune) — `34394cd`
-- [ ] 3. Tool descriptions to .txt files
+- [x] 3. Tool descriptions to .txt files — `5339404`
 - [ ] 4. (stretch) provider coverage hardening
 
 ## Scope correction (read this first)
@@ -135,7 +135,43 @@ at the call site, so there is no way to observe whether compaction ran on a give
 
 ### 2026-08-17 — iteration 3 (next)
 
-Starting task 3, tool descriptions to `.txt` files.
+**Task 3 done** — `5339404`, pushed. typecheck 3/3, lint clean, 382 tests (27 new).
+
+All six descriptions moved to sibling `.txt` files via Bun's native text import. Byte-identity is
+proven, not claimed: the fixture was captured by running the modules at `b0dd469` before the move,
+and the reviewer independently reconstructed the pre-refactor strings with `git show HEAD` and
+confirmed all six match byte for byte.
+
+Review found one real problem with the naive move (HIGH), fixed before commit. Four descriptions
+interpolated live constants — `DEFAULT_TIMEOUT`, `MAX_TIMEOUT`, `DEFAULT_LIMIT`, `SCAN_CEILING`,
+`MAX_LINE_CHARS`, the skipped-directory lists. Flattening them to literal text would have frozen
+values that are *still* interpolated into the parameter schema a few lines away in the same file,
+so changing a constant later would tell the model two contradictory things with nothing to catch
+it. The `.txt` files now carry `{{TOKEN}}` placeholders filled at load from the constants
+themselves, and a test asserts no placeholder survives into model-facing text. `bash`'s "2000 lines
+or 50KB" now renders from the registry's own `MAX_LINES`/`MAX_BYTES`, so it tracks real behaviour
+rather than restating it.
+
+Also verified rather than assumed: prettier leaves `.txt` alone (`--ignore-unknown` has no parser
+for it), the files are not gitignored, and `bun-types` supplies the `*.txt` module declaration so
+no hand-written shim is needed.
+
+MEDIUM left as process advice, recorded here: the fixture's provenance rests on the capture having
+happened before the move. That is true for this change and independently confirmed, but nothing
+mechanically stops a future contributor from "fixing" a red test by regenerating the fixture from
+current code, which would make it self-confirming. The docstring names the source commit and says
+not to.
+
+### 2026-08-17 — iteration 4 (next)
+
+Task 4 re-scoped and started. `OVERNIGHT.md` targets `model/anthropic/client.ts` at ~7% coverage;
+no such file exists here (provider access is the Vercel AI SDK behind a ~60-line `provider.ts`
+with no branching worth cassettes). Per decision D4 the useful equivalent is `session/run.ts` —
+the agent loop, the least-tested critical path in the repo, with no direct tests at all.
+
+That needs a seam first: `run.ts` imports `resolveModel` directly, so no offline test can reach
+the loop without a live provider call. `OVERNIGHT.md` forbids live API calls absolutely, so the
+seam is a precondition, not a nicety.
 
 ## Needs review in the morning
 
