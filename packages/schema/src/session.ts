@@ -7,7 +7,7 @@ import { SessionID } from "./id"
  */
 export const Session = Schema.Struct({
   id: SessionID,
-  parentID: Schema.optional(SessionID),
+  parentID: Schema.optionalKey(SessionID),
   title: Schema.String,
   directory: Schema.String,
   timeCreated: Schema.Number,

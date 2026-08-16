@@ -1,4 +1,4 @@
-import { Context as EffectContext, Effect, Layer } from "effect"
+import { Context as EffectContext, Effect, Layer, Result as EffectResult } from "effect"
 import { bound } from "./truncate"
 import { decode, validName, type Context, type Result, type Tool } from "./tool"
 
@@ -23,7 +23,7 @@ export interface Interface {
   }) => Effect.Effect<Settlement>
 }
 
-export class ToolRegistry extends EffectContext.Tag("compass/ToolRegistry")<ToolRegistry, Interface>() {}
+export class ToolRegistry extends EffectContext.Service<ToolRegistry, Interface>()("compass/ToolRegistry") {}
 
 export function make(registrations: readonly Registration[]): Interface {
   const byName = new Map<string, Tool<any>>()
@@ -43,20 +43,20 @@ export function make(registrations: readonly Registration[]): Interface {
 
         const settled = yield* decode(tool, input.input).pipe(
           Effect.flatMap((decoded) => tool.execute(decoded, input.context)),
-          Effect.either,
+          Effect.result,
         )
 
-        if (settled._tag === "Left") return { ok: false as const, error: settled.left.message }
+        if (EffectResult.isFailure(settled)) return { ok: false as const, error: settled.failure.message }
 
         // Bounding is applied after a successful operation, never before it, so a
         // tool that succeeded is never reported as failed because it said too much.
-        const limited = bound(settled.right.output)
+        const limited = bound(settled.success.output)
         return {
           ok: true as const,
-          result: limited.truncated ? { ...settled.right, output: limited.content } : settled.right,
+          result: limited.truncated ? { ...settled.success, output: limited.content } : settled.success,
         }
       }).pipe(
-        Effect.catchAllDefect((defect) =>
+        Effect.catchDefect((defect) =>
           Effect.succeed({
             ok: false as const,
             error: defect instanceof Error ? defect.message : String(defect),

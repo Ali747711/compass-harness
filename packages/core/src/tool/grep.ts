@@ -41,14 +41,16 @@ const MAX_FALLBACK_FILE_BYTES = 10 * 1024 * 1024
 const SKIPPED_DIRECTORIES = new Set([".git", "node_modules"])
 
 const Parameters = Schema.Struct({
-  pattern: Schema.String.annotations({ description: "The regex pattern to search for in file contents" }),
-  path: Schema.optional(Schema.String).annotations({
+  pattern: Schema.String.annotate({ description: "The regex pattern to search for in file contents" }),
+  path: Schema.optionalKey(Schema.String).annotate({
     description: "File or directory to search. Defaults to the current working directory.",
   }),
-  include: Schema.optional(Schema.String).annotations({
+  include: Schema.optionalKey(Schema.String).annotate({
     description: 'File glob to restrict the search to (e.g. "*.js", "*.{ts,tsx}")',
   }),
-  limit: Schema.optional(Schema.Number.pipe(Schema.int(), Schema.between(1, MAX_LIMIT))).annotations({
+  limit: Schema.optionalKey(
+    Schema.Number.check(Schema.isInt(), Schema.isBetween({ minimum: 1, maximum: MAX_LIMIT })),
+  ).annotate({
     description: `Maximum number of matches to return (default ${DEFAULT_LIMIT}, max ${MAX_LIMIT})`,
   }),
 })
@@ -103,7 +105,7 @@ const RipgrepMatch = Schema.Struct({
 })
 
 // Non-match records (begin/end/summary) and unparseable lines decode to None and are dropped.
-const decodeRecord = Schema.decodeUnknownOption(Schema.parseJson(RipgrepMatch))
+const decodeRecord = Schema.decodeUnknownOption(Schema.fromJsonString(RipgrepMatch))
 
 const parseRecord = (line: string, cwd: string): Hit | undefined => {
   if (line.length === 0 || Buffer.byteLength(line, "utf8") > MAX_RECORD_BYTES) return undefined

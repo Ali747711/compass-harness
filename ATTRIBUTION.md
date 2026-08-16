@@ -12,9 +12,15 @@ Every ported file carries a header naming its origin:
 
 ## Ported files
 
-| compass-harness | opencode origin | Notes                               |
-| --------------- | --------------- | ----------------------------------- |
-| _none yet_      |                 | First ports land in M1 (tool loop). |
+| compass-harness                            | opencode origin                                 | Notes                                                                                                                                                                                               |
+| ------------------------------------------ | ----------------------------------------------- | --------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| `packages/core/src/tool/edit-replacers.ts` | `packages/opencode/src/tool/edit.ts:217-737`    | Verbatim. Ten fallback matching strategies, `levenshtein`, `replace`, `trimDiff`. Only change: 35 non-null assertions for `noUncheckedIndexedAccess`. Verified byte-identical after stripping them. |
+| `packages/core/src/tool/truncate.ts`       | `packages/core/src/tool-output-store.ts:50-110` | `takePrefix`/`takeSuffix`/`preview` middle-out bounding. Managed output files deferred to M1.6.                                                                                                     |
+
+> Note: an earlier revision of `truncate.ts` was adapted from `packages/opencode/src/tool/truncate.ts`.
+> That is opencode's **legacy V1** path and clips head-or-tail. The V2 store above preserves the
+> beginning and end, which is what `CONTEXT.md` specifies and what keeps tool-appended framing
+> (pagination hints, exit codes, stderr) visible to the model.
 
 ## Planned ports
 

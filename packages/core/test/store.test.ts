@@ -7,7 +7,7 @@ import { SessionNotFound, SessionStore, layer as storeLayer } from "../src/sessi
 const TestLayer = storeLayer.pipe(Layer.provideMerge(layerMemory))
 
 const run = <A, E>(effect: Effect.Effect<A, E, SessionStore>) =>
-  Effect.runPromise(effect.pipe(Effect.provide(TestLayer), Effect.scoped) as Effect.Effect<A, E>)
+  Effect.runPromise(effect.pipe(Effect.provide(TestLayer), Effect.scoped))
 
 describe("SessionStore", () => {
   test("creates and reads back a session", async () => {

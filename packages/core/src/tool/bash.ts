@@ -50,15 +50,15 @@ Git and GitHub:
 - Use \`gh\` for GitHub work and return the PR URL when you are done.`
 
 const Parameters = Schema.Struct({
-  command: Schema.String.annotations({
+  command: Schema.String.annotate({
     description: "The bash command to execute. Runs in the session's working directory in a fresh shell.",
   }),
-  timeout: Schema.optional(
-    Schema.Number.pipe(Schema.int(), Schema.positive()).annotations({
+  timeout: Schema.optionalKey(
+    Schema.Number.check(Schema.isInt(), Schema.isGreaterThan(0)).annotate({
       description: `Timeout in milliseconds. Defaults to ${DEFAULT_TIMEOUT}, clamped to a maximum of ${MAX_TIMEOUT}.`,
     }),
   ),
-  description: Schema.String.annotations({
+  description: Schema.String.annotate({
     description:
       "What this command does, in 5-10 words of active voice (e.g. 'Run the core test suite'). Shown to the user.",
   }),

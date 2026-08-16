@@ -36,7 +36,7 @@ export interface Interface {
   readonly messages: (sessionID: SessionID) => Effect.Effect<readonly { info: Message; parts: readonly Part[] }[]>
 }
 
-export class SessionStore extends Context.Tag("compass/SessionStore")<SessionStore, Interface>() {}
+export class SessionStore extends Context.Service<SessionStore, Interface>()("compass/SessionStore") {}
 
 export const layer = Layer.effect(
   SessionStore,

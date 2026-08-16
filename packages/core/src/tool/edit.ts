@@ -28,17 +28,17 @@ Usage:
 Returns a unified diff of what changed.`
 
 const InputSchema = Schema.Struct({
-  filePath: Schema.String.annotations({
+  filePath: Schema.String.annotate({
     description: "Path to the file to modify. Absolute, or relative to the session working directory.",
   }),
-  oldString: Schema.String.annotations({
+  oldString: Schema.String.annotate({
     description: "The exact text to replace, copied verbatim from the file including indentation.",
   }),
-  newString: Schema.String.annotations({
+  newString: Schema.String.annotate({
     description: "The text to replace it with. Must differ from oldString; empty deletes the matched text.",
   }),
-  replaceAll: Schema.optional(
-    Schema.Boolean.annotations({
+  replaceAll: Schema.optionalKey(
+    Schema.Boolean.annotate({
       description: "Replace every occurrence of oldString instead of requiring a unique match. Defaults to false.",
     }),
   ),

@@ -22,15 +22,15 @@ The result reports whether the file was created or overwritten, along with its s
 write landed without reading the file back.`
 
 const Input = Schema.Struct({
-  filePath: Schema.String.annotations({
+  filePath: Schema.String.annotate({
     description: "Path of the file to write. Absolute is preferred; relative resolves against the session directory.",
   }),
-  content: Schema.String.annotations({
+  content: Schema.String.annotate({
     description: "The complete contents to write. Replaces the whole file when one already exists.",
   }),
 })
 
-type Input = Schema.Schema.Type<typeof Input>
+type Input = typeof Input.Type
 
 const reason = (error: unknown) => (error instanceof Error ? error.message : String(error))
 

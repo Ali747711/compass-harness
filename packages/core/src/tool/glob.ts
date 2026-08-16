@@ -31,17 +31,17 @@ const DESCRIPTION = `Fast file-path search by glob pattern. Reach for this whene
 - For open-ended exploration that will need many rounds of globbing and grepping, delegate to a subagent instead of driving it yourself.`
 
 const Parameters = Schema.Struct({
-  pattern: Schema.String.annotations({
+  pattern: Schema.String.annotate({
     description: 'The glob pattern to match file paths against, e.g. "**/*.ts" or "src/**/config.*"',
   }),
-  path: Schema.optional(
-    Schema.String.annotations({
+  path: Schema.optionalKey(
+    Schema.String.annotate({
       description:
         "The directory to search in. Defaults to the session working directory; omit this field to use the default rather than passing an empty string.",
     }),
   ),
-  limit: Schema.optional(
-    Schema.Number.pipe(Schema.int(), Schema.between(1, MAX_LIMIT)).annotations({
+  limit: Schema.optionalKey(
+    Schema.Number.check(Schema.isInt(), Schema.isBetween({ minimum: 1, maximum: MAX_LIMIT })).annotate({
       description: `Maximum number of paths to return, 1-${MAX_LIMIT}. Defaults to ${DEFAULT_LIMIT}. The most recently modified matches are kept.`,
     }),
   ),

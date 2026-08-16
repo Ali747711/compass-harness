@@ -5,7 +5,7 @@
 // (this harness has no attachment channel yet, so those refuse instead), and
 // `offset` is a 0-based line index rather than 1-indexed.
 
-import { Effect, Either, Schema } from "effect"
+import { Effect, Result, Schema } from "effect"
 import { readdir, stat } from "node:fs/promises"
 import { basename, dirname, extname, isAbsolute, join, relative, resolve } from "node:path"
 import { ToolFailure, make } from "./tool"
@@ -34,20 +34,18 @@ Usage:
 - A path that does not exist is an error, and names similar files in the same directory when it can. Use glob when you are unsure of a path.`
 
 const Input = Schema.Struct({
-  filePath: Schema.String.annotations({
+  filePath: Schema.String.annotate({
     description: "Path to the file to read. Absolute, or relative to the session's working directory.",
   }),
-  offset: Schema.optional(
-    Schema.Number.pipe(Schema.int(), Schema.greaterThanOrEqualTo(0)).annotations({ title: "offset" }),
-  ).annotations({
+  offset: Schema.optionalKey(Schema.Number.check(Schema.isInt(), Schema.isGreaterThanOrEqualTo(0))).annotate({
     description: "0-based line index to start reading from. Line 1 of the file is offset 0. Defaults to 0.",
   }),
-  limit: Schema.optional(
-    Schema.Number.pipe(Schema.int(), Schema.positive()).annotations({ title: "limit" }),
-  ).annotations({ description: `Maximum number of lines to return. Defaults to ${DEFAULT_LIMIT}.` }),
+  limit: Schema.optionalKey(Schema.Number.check(Schema.isInt(), Schema.isGreaterThan(0))).annotate({
+    description: `Maximum number of lines to return. Defaults to ${DEFAULT_LIMIT}.`,
+  }),
 })
 
-type Input = Schema.Schema.Type<typeof Input>
+type Input = typeof Input.Type
 
 const IMAGE_EXTENSIONS = new Set([
   ".png",
@@ -215,16 +213,16 @@ export const readTool = make<Input>({
       const filePath = isAbsolute(input.filePath) ? input.filePath : resolve(context.directory, input.filePath)
       const title = label(filePath, context.directory)
 
-      const stats = yield* Effect.tryPromise({ try: () => stat(filePath), catch: errnoCode }).pipe(Effect.either)
-      if (Either.isLeft(stats)) {
+      const stats = yield* Effect.tryPromise({ try: () => stat(filePath), catch: errnoCode }).pipe(Effect.result)
+      if (Result.isFailure(stats)) {
         // ENOTDIR means a parent component is a file, e.g. reading `notes.txt/inner`.
-        if (stats.left === "ENOENT" || stats.left === "ENOTDIR") return yield* missing(filePath)
+        if (stats.failure === "ENOENT" || stats.failure === "ENOTDIR") return yield* missing(filePath)
         return yield* new ToolFailure({
-          message: `Cannot access ${filePath}${stats.left === undefined ? "" : ` (${stats.left})`}.`,
+          message: `Cannot access ${filePath}${stats.failure === undefined ? "" : ` (${stats.failure})`}.`,
         })
       }
 
-      const info = stats.right
+      const info = stats.success
       if (info.isDirectory()) {
         return yield* new ToolFailure({
           message: `${filePath} is a directory, not a file. Read one of the files inside it, or use glob to list its contents.`,

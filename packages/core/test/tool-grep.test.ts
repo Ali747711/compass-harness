@@ -1,11 +1,11 @@
 import { messageID, sessionID } from "@compass/schema"
 import { afterAll, afterEach, beforeEach, describe, expect, test } from "bun:test"
-import { Effect, Either } from "effect"
+import { Effect, Result } from "effect"
 import { mkdirSync, mkdtempSync, rmSync, utimesSync, writeFileSync } from "node:fs"
 import { tmpdir } from "node:os"
 import { join } from "node:path"
 import { grepTool } from "../src/tool/grep"
-import { decode, type Context, type Result, type ToolFailure } from "../src/tool/tool"
+import { decode, type Context, type Result as ToolResult, type ToolFailure } from "../src/tool/tool"
 
 const roots: string[] = []
 
@@ -37,22 +37,22 @@ interface Input {
 }
 
 const settle = (input: Input, directory: string, signal?: AbortSignal) =>
-  Effect.runPromise(grepTool.execute(input, context(directory, signal)).pipe(Effect.either))
+  Effect.runPromise(grepTool.execute(input, context(directory, signal)).pipe(Effect.result))
 
 const succeed = async (input: Input, directory: string) => {
   const result = await settle(input, directory)
-  if (Either.isLeft(result)) throw new Error(`expected success, got: ${result.left.message}`)
-  return result.right
+  if (Result.isFailure(result)) throw new Error(`expected success, got: ${result.failure.message}`)
+  return result.success
 }
 
 const fail = async (input: Input, directory: string, signal?: AbortSignal) => {
   const result = await settle(input, directory, signal)
-  if (Either.isRight(result)) throw new Error(`expected failure, got: ${result.right.output}`)
-  return result.left
+  if (Result.isSuccess(result)) throw new Error(`expected failure, got: ${result.success.output}`)
+  return result.failure
 }
 
 /** Distinct file paths in the order the output lists them. */
-const matchedFiles = (result: Result) => {
+const matchedFiles = (result: ToolResult) => {
   const paths = result.output
     .split("\n")
     .map((line) => /^(.+?):\d+:/.exec(line)?.[1])
@@ -229,18 +229,18 @@ for (const engine of engines) {
 }
 
 describe("grepTool contract", () => {
-  const run = <A>(effect: Effect.Effect<A, ToolFailure>) => Effect.runPromise(effect.pipe(Effect.either))
+  const run = <A>(effect: Effect.Effect<A, ToolFailure>) => Effect.runPromise(effect.pipe(Effect.result))
 
   test("requires a pattern", async () => {
     const decoded = await run(decode(grepTool, { path: "." }))
-    expect(Either.isLeft(decoded)).toBe(true)
+    expect(Result.isFailure(decoded)).toBe(true)
   })
 
   test("rejects a limit outside the supported range", async () => {
-    expect(Either.isLeft(await run(decode(grepTool, { pattern: "x", limit: 0 })))).toBe(true)
-    expect(Either.isLeft(await run(decode(grepTool, { pattern: "x", limit: 1.5 })))).toBe(true)
-    expect(Either.isLeft(await run(decode(grepTool, { pattern: "x", limit: 5000 })))).toBe(true)
-    expect(Either.isRight(await run(decode(grepTool, { pattern: "x", limit: 25 })))).toBe(true)
+    expect(Result.isFailure(await run(decode(grepTool, { pattern: "x", limit: 0 })))).toBe(true)
+    expect(Result.isFailure(await run(decode(grepTool, { pattern: "x", limit: 1.5 })))).toBe(true)
+    expect(Result.isFailure(await run(decode(grepTool, { pattern: "x", limit: 5000 })))).toBe(true)
+    expect(Result.isSuccess(await run(decode(grepTool, { pattern: "x", limit: 25 })))).toBe(true)
   })
 
   test("documents every parameter for the model", () => {
