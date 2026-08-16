@@ -145,7 +145,7 @@ confirmed all six match byte for byte.
 Review found one real problem with the naive move (HIGH), fixed before commit. Four descriptions
 interpolated live constants — `DEFAULT_TIMEOUT`, `MAX_TIMEOUT`, `DEFAULT_LIMIT`, `SCAN_CEILING`,
 `MAX_LINE_CHARS`, the skipped-directory lists. Flattening them to literal text would have frozen
-values that are *still* interpolated into the parameter schema a few lines away in the same file,
+values that are _still_ interpolated into the parameter schema a few lines away in the same file,
 so changing a constant later would tell the model two contradictory things with nothing to catch
 it. The `.txt` files now carry `{{TOKEN}}` placeholders filled at load from the constants
 themselves, and a test asserts no placeholder survives into model-facing text. `bash`'s "2000 lines
