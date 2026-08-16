@@ -2,7 +2,7 @@
 
 ## Task status
 
-- [ ] 1. Tool-output truncation with file spill
+- [x] 1. Tool-output truncation with file spill — `c92b2cf`
 - [ ] 2. Compaction tier 1 (prune)
 - [ ] 3. Tool descriptions to .txt files
 - [ ] 4. (stretch) provider coverage hardening
@@ -66,7 +66,41 @@ today. Will re-scope explicitly if reached.
   All 13 golden-transcript failures share one cause —
   `expect(...).toMatchFileSnapshot is not a function` — which is a Bun API mismatch, not a content
   diff. That repo cannot currently satisfy `OVERNIGHT.md`'s "completely green" gate on this machine.
-- Starting task 1 here.
+- **Task 1 done** — `c92b2cf`, pushed to `location-scoping`. typecheck 3/3, lint clean, 333 tests
+  in `packages/core` (21 of them new).
+
+  Full text now spills to `<session>/.compass/tool-output/<sessionID>/<callID>.txt`; the bounded
+  preview names the path. `exceeds()` lets the registry spill before bounding, because the marker
+  must carry the path and writing is async while bounding is not.
+
+  Code review returned 2 CRITICAL and 1 HIGH, all reproduced, all fixed before commit with a
+  regression test each:
+  1. **Path traversal via `callID`.** It is the provider's `toolCallId` — untrusted, typed as a
+     bare string. A `../` in it wrote outside the spill root entirely. Now allowlisted per segment
+     and containment-checked against the root.
+  2. **Spill was landing unignored in the user's working tree.** It holds raw tool output — file
+     contents, shell stdout, fetched pages — in whatever project the session runs in, one
+     `git add .` from being committed. The spill root now writes its own `.gitignore` of `*` on
+     creation, so every project is protected, not just this one.
+  3. **`Effect.promise` on a rejecting `rm` becomes a defect**, and `Effect.ignore` does not catch
+     defects. A permission error during the retention sweep crashed the CLI *after* the prompt had
+     already succeeded. `sweep`/`clear` can no longer fail through any channel.
+
+  Two LOW findings left alone deliberately: `stat` vs `lstat` for staleness (spill only ever
+  creates real files itself), and env-derived limits being read at module load (correct for a
+  one-shot CLI, revisit when a config layer or long-lived server lands).
+
+- **Correction:** the `c92b2cf` message claims "349 tests passing". The real figure is 333.
+  `OVERNIGHT.md` forbids force-push in any form, so the message cannot be amended — recorded here
+  instead rather than left as a false claim in history.
+
+- `Spill.clear` is implemented and tested but has no call site: there is no session-close lifecycle
+  in the CLI yet. The age-based half of the cleanup rule runs after each prompt. Noted for review.
+
+### 2026-08-17 — iteration 2 (next)
+
+Starting task 2, compaction tier 1 (prune). No `context/pipeline.ts` seam exists here, so it has to
+be created rather than filled in.
 
 ## Needs review in the morning
 
