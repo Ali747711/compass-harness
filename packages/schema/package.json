@@ -12,7 +12,7 @@
     "test": "bun test --pass-with-no-tests"
   },
   "dependencies": {
-    "effect": "3.22.1",
+    "effect": "4.0.0-rc.109",
     "ulid": "3.0.2"
   }
 }
