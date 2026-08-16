@@ -8,7 +8,14 @@
     // Effect uses function* with Effect.gen that does not always yield
     "require-yield": "off",
     // Namespace-style module re-exports are the convention here
-    "unicorn/consistent-function-scoping": "off"
+    "unicorn/consistent-function-scoping": "off",
+    // Sorting a locally-created array in place is fine; opencode takes the same view
+    "unicorn/no-array-sort": "off",
+    "unicorn/no-array-reverse": "off",
+    // Effect's discriminant is _tag; tests legitimately assert on it
+    "no-underscore-dangle": "off",
+    // edit-replacers.ts is a verbatim port and shadows `_` exactly as upstream does
+    "no-shadow": "off"
   },
   "ignorePatterns": ["**/node_modules", "**/dist"]
 }

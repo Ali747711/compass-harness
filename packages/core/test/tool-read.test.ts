@@ -1,10 +1,12 @@
 import { MessageID, SessionID } from "@compass/schema"
 import { afterAll, beforeAll, describe, expect, test } from "bun:test"
 import { Effect } from "effect"
-import { mkdirSync, mkdtempSync, rmSync, writeFileSync } from "node:fs"
+import { mkdirSync, mkdtempSync, realpathSync, rmSync, symlinkSync, writeFileSync } from "node:fs"
 import { tmpdir } from "node:os"
-import { join } from "node:path"
+import { join, relative } from "node:path"
+import { PermissionDenied, type Request as PermissionRequest } from "../src/permission/permission"
 import { readTool } from "../src/tool/read"
+import { make as makeRegistry } from "../src/tool/registry"
 import type { Context } from "../src/tool/tool"
 
 type Input = Parameters<typeof readTool.execute>[0]
@@ -16,6 +18,7 @@ const context = (overrides: Partial<Context> = {}): Context => ({
   messageID: MessageID.make("msg_read_test"),
   callID: "call_read_test",
   directory: root,
+  ask: () => Effect.void,
   abort: new AbortController().signal,
   ...overrides,
 })
@@ -30,6 +33,41 @@ const write = (name: string, content: string) => {
   const path = join(root, name)
   writeFileSync(path, content)
   return path
+}
+
+/** Records every authorization request and grants it. */
+const recordingAsk = (log: PermissionRequest[]) => (request: PermissionRequest) =>
+  Effect.sync(() => {
+    log.push(request)
+  })
+
+const denyingAsk = (request: PermissionRequest) =>
+  Effect.fail(new PermissionDenied({ permission: request.permission, pattern: request.patterns[0] ?? "*" }))
+
+/**
+ * Aborts once `aborted` has been read `allowed` times, which pins down *where*
+ * the tool checks: a tool that only checks at entry never trips it.
+ */
+const abortAfter = (allowed: number): AbortSignal => {
+  const controller = new AbortController()
+  let seen = 0
+  return new Proxy(controller.signal, {
+    get: (target, property) => {
+      if (property !== "aborted") {
+        const value = Reflect.get(target, property)
+        return typeof value === "function" ? value.bind(target) : value
+      }
+      seen += 1
+      if (seen > allowed) controller.abort()
+      return target.aborted
+    },
+  })
+}
+
+const aborted = () => {
+  const controller = new AbortController()
+  controller.abort()
+  return controller.signal
 }
 
 beforeAll(() => {
@@ -57,7 +95,7 @@ describe("readTool", () => {
         "(End of file - 3 lines)",
       ].join("\n"),
     )
-    expect(result.metadata).toMatchObject({ lineStart: 1, lineEnd: 3, totalLines: 3, truncated: false })
+    expect(result.metadata).toMatchObject({ totalLines: 3, requestedOffset: 0, more: false })
   })
 
   test("resolves a relative path against the session directory", async () => {
@@ -183,6 +221,20 @@ describe("readTool", () => {
     expect(failure.message).toContain("is an image")
   })
 
+  test("refuses a zero-byte image instead of calling it an empty text file", async () => {
+    const path = write("blank.png", "")
+    const failure = await readError({ filePath: path })
+
+    expect(failure.message).toContain("is an image")
+  })
+
+  test("refuses a zero-byte archive instead of calling it an empty text file", async () => {
+    const path = write("blank.zip", "")
+    const failure = await readError({ filePath: path })
+
+    expect(failure.message).toContain("is a binary format")
+  })
+
   test("refuses a known binary extension", async () => {
     const path = write("bundle.zip", "pretend archive\n")
     const failure = await readError({ filePath: path })
@@ -225,5 +277,207 @@ describe("readTool", () => {
 
     expect(result.output).toContain("3: c")
     expect(result.output).toContain("(End of file - 3 lines)")
+  })
+})
+
+describe("readTool metadata", () => {
+  test("states no delivered line range, because the registry bounds output afterwards", async () => {
+    const path = write("meta-window.txt", Array.from({ length: 2500 }, (_, i) => `m${i + 1}`).join("\n") + "\n")
+    const result = await read({ filePath: path })
+
+    // lineStart/lineEnd used to claim 1-2000 while middle-out bounding delivered
+    // roughly half of that, so the metadata contradicted the text the model saw.
+    expect(result.metadata).not.toHaveProperty("lineStart")
+    expect(result.metadata).not.toHaveProperty("lineEnd")
+    expect(result.metadata).toMatchObject({ totalLines: 2500, requestedOffset: 0, requestedLimit: 2000, more: true })
+  })
+
+  test("reports the window that was asked for, not one that was delivered", async () => {
+    const path = write("meta-offset.txt", Array.from({ length: 10 }, (_, i) => `n${i + 1}`).join("\n") + "\n")
+    const result = await read({ filePath: path, offset: 4, limit: 3 })
+
+    expect(result.metadata).toMatchObject({ requestedOffset: 4, requestedLimit: 3, totalLines: 10, more: true })
+  })
+})
+
+describe("readTool bounding", () => {
+  test("the continuation footer survives registry bounding of a large file", async () => {
+    const path = write("bounded.txt", Array.from({ length: 2500 }, (_, i) => `b${i + 1}`).join("\n") + "\n")
+    const registry = makeRegistry([{ name: "read", tool: readTool }], { ask: () => Effect.void })
+
+    const settled = await Effect.runPromise(
+      registry.settle({
+        name: "read",
+        input: { filePath: path },
+        context: {
+          sessionID: SessionID.make("ses_read_test"),
+          messageID: MessageID.make("msg_read_test"),
+          callID: "call_read_test",
+          directory: root,
+          abort: new AbortController().signal,
+        },
+      }),
+    )
+
+    expect(settled.ok).toBe(true)
+    if (!settled.ok) return
+    // The whole point of middle-out bounding: the trailing hint is what tells the
+    // model how to get the rest, so losing it strands the read.
+    expect(settled.result.output).toContain("(Showing lines 1-2000 of 2500. Use offset=2000 to continue.)")
+    expect(settled.result.output).toContain("truncated")
+    expect(settled.result.output).toContain("1: b1")
+  })
+})
+
+describe("readTool suggestions", () => {
+  test("does not suggest unrelated names just because they share a letter", async () => {
+    const directory = mkdtempSync(join(tmpdir(), "compass-read-noise-"))
+    writeFileSync(join(directory, "a.go"), "package main\n")
+    writeFileSync(join(directory, "e.md"), "# doc\n")
+    writeFileSync(join(directory, "zzz.txt"), "noise\n")
+
+    const failure = await readError({ filePath: join(directory, "read.ts") }, { directory })
+
+    expect(failure.message).toContain("File not found")
+    expect(failure.message).not.toContain("Did you mean")
+    expect(failure.message).not.toContain("a.go")
+    expect(failure.message).not.toContain("zzz.txt")
+    rmSync(directory, { recursive: true, force: true })
+  })
+
+  test("still suggests a genuine near-miss that differs only in extension", async () => {
+    const directory = mkdtempSync(join(tmpdir(), "compass-read-near-"))
+    writeFileSync(join(directory, "handler.tsx"), "export {}\n")
+
+    const failure = await readError({ filePath: join(directory, "handler.ts") }, { directory })
+
+    expect(failure.message).toContain("Did you mean")
+    expect(failure.message).toContain("handler.tsx")
+    rmSync(directory, { recursive: true, force: true })
+  })
+
+  test("says how many similar names were withheld instead of dropping them silently", async () => {
+    const directory = mkdtempSync(join(tmpdir(), "compass-read-many-"))
+    for (const name of ["report1.md", "report2.md", "report3.md", "report4.md", "report5.md"]) {
+      writeFileSync(join(directory, name), "x\n")
+    }
+
+    const failure = await readError({ filePath: join(directory, "report.md") }, { directory })
+
+    expect(failure.message).toContain("Did you mean")
+    expect(failure.message).toContain("2 further similar names not shown.")
+    rmSync(directory, { recursive: true, force: true })
+  })
+})
+
+describe("readTool path containment", () => {
+  test("asks before reading a file outside the session directory", async () => {
+    const outside = mkdtempSync(join(tmpdir(), "compass-read-outside-"))
+    writeFileSync(join(outside, "secret.txt"), "classified\n")
+    const log: PermissionRequest[] = []
+
+    const result = await read({ filePath: join(outside, "secret.txt") }, { ask: recordingAsk(log) })
+
+    expect(result.output).toContain("1: classified")
+    expect(log).toHaveLength(1)
+    expect(log[0]?.permission).toBe("external_directory")
+    rmSync(outside, { recursive: true, force: true })
+  })
+
+  test("refuses an escaping relative path when permission is denied", async () => {
+    const outside = mkdtempSync(join(tmpdir(), "compass-read-escape-"))
+    writeFileSync(join(outside, "escape.txt"), "nope\n")
+
+    const escaping = relative(root, join(outside, "escape.txt"))
+    expect(escaping.startsWith("..")).toBe(true)
+    const failure = await readError({ filePath: escaping }, { ask: denyingAsk })
+
+    expect(failure.message).toContain("outside the session directory")
+    rmSync(outside, { recursive: true, force: true })
+  })
+
+  test("refuses an absolute path outside the session directory when permission is denied", async () => {
+    const outside = mkdtempSync(join(tmpdir(), "compass-read-denied-"))
+    writeFileSync(join(outside, "denied.txt"), "nope\n")
+
+    const failure = await readError({ filePath: join(outside, "denied.txt") }, { ask: denyingAsk })
+
+    expect(failure.message).toContain("outside the session directory")
+    expect(failure.message).not.toContain("1: nope")
+    rmSync(outside, { recursive: true, force: true })
+  })
+
+  test("treats a symlink pointing out of the session directory as an escape", async () => {
+    const outside = mkdtempSync(join(tmpdir(), "compass-read-symlink-"))
+    const target = join(realpathSync(outside), "target.txt")
+    writeFileSync(target, "linked\n")
+    const link = join(root, "escape-link.txt")
+    symlinkSync(target, link)
+
+    const failure = await readError({ filePath: link }, { ask: denyingAsk })
+
+    expect(failure.message).toContain("outside the session directory")
+    rmSync(link, { force: true })
+    rmSync(outside, { recursive: true, force: true })
+  })
+
+  test("allows a symlink that stays inside the session directory without asking", async () => {
+    const target = write("link-target.txt", "inside\n")
+    const link = join(root, "inside-link.txt")
+    symlinkSync(target, link)
+    const log: PermissionRequest[] = []
+
+    const result = await read({ filePath: link }, { ask: recordingAsk(log) })
+
+    expect(result.output).toContain("1: inside")
+    expect(log).toHaveLength(0)
+    rmSync(link, { force: true })
+  })
+
+  test("refuses a blank path", async () => {
+    const failure = await readError({ filePath: "   " })
+    expect(failure.message).toContain("must not be empty")
+  })
+})
+
+describe("readTool cancellation", () => {
+  test("refuses to start once the turn is already aborted", async () => {
+    const path = write("cancel-entry.txt", "one\ntwo\n")
+    const failure = await readError({ filePath: path }, { abort: aborted() })
+
+    expect(failure.message).toContain("was cancelled")
+  })
+
+  test("checks the abort signal between awaits, not only at entry", async () => {
+    const path = write("cancel-mid.txt", Array.from({ length: 5000 }, (_, i) => `c${i + 1}`).join("\n") + "\n")
+    // Entry check passes; the signal only trips on a later check.
+    const failure = await readError({ filePath: path }, { abort: abortAfter(1) })
+
+    expect(failure.message).toContain("was cancelled")
+  })
+})
+
+describe("readTool wide lines", () => {
+  test("cuts a long line by code point, never mid surrogate pair", async () => {
+    // The odd leading character puts a UTF-16 cut squarely inside a surrogate pair.
+    const path = write("astral.txt", `a${"🚀".repeat(2500)}\ntail\n`)
+    const result = await read({ filePath: path })
+
+    const line = result.output.split("\n")[2] ?? ""
+    const content = line.slice("1: ".length).replace(/\.\.\. \(line truncated.*\)$/, "")
+    expect(Array.from(content)).toHaveLength(2000)
+    expect(content).not.toMatch(/[\uD800-\uDBFF](?![\uDC00-\uDFFF])/)
+    expect(content).not.toMatch(/(?<![\uD800-\uDBFF])[\uDC00-\uDFFF]/)
+    expect(line).toContain("line truncated at 2000 characters")
+    expect(result.output).toContain("2: tail")
+  })
+
+  test("leaves a wide astral line alone when it fits the code point budget", async () => {
+    // 1500 emoji is 3000 UTF-16 units: a unit-based budget would have cut it.
+    const path = write("astral-fits.txt", `${"🚀".repeat(1500)}\n`)
+    const result = await read({ filePath: path })
+
+    expect(result.output).not.toContain("line truncated")
+    expect(result.output).toContain("🚀".repeat(1500))
   })
 })

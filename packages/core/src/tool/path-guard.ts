@@ -1,0 +1,80 @@
+import { Effect } from "effect"
+import { realpathSync } from "node:fs"
+import { dirname, isAbsolute, join, relative, resolve } from "node:path"
+import { ToolFailure, type Context } from "./tool"
+
+/**
+ * True when `target` is `directory` itself or lives beneath it.
+ *
+ * Mirrors opencode's `containsPath`, with one deliberate difference: symlinks are
+ * resolved first. opencode compares lexical paths, so a symlink inside the project
+ * pointing outside it reads as contained. That is a real escape, and resolving it
+ * costs nothing here because the guard already touches the filesystem.
+ */
+export function contains(directory: string, target: string) {
+  const root = realOrLexical(directory)
+  const full = realOrLexical(target)
+  if (root === full) return true
+  const rel = relative(root, full)
+  return rel !== "" && !rel.startsWith("..") && !isAbsolute(rel)
+}
+
+/**
+ * Resolves the deepest existing ancestor, so a path whose leaf does not exist yet
+ * (the common case for `write`) is still checked against its real parent.
+ */
+function realOrLexical(target: string): string {
+  const absolute = resolve(target)
+  let current = absolute
+  const trailing: string[] = []
+  for (;;) {
+    try {
+      return join(realpathSync(current), ...trailing)
+    } catch {
+      const parent = dirname(current)
+      if (parent === current) return absolute
+      trailing.unshift(current.slice(parent.length + 1))
+      current = parent
+    }
+  }
+}
+
+export interface GuardOptions {
+  /** "directory" treats the target itself as the directory to authorize. */
+  readonly kind?: "file" | "directory"
+}
+
+/**
+ * Resolves `target` against the session directory and, when it lands outside,
+ * asks for the `external_directory` permission before allowing the tool to
+ * proceed. Returns the resolved absolute path.
+ *
+ * This is a guardrail, not a sandbox — `bash` grants full system access anyway.
+ * Its job is to make an out-of-project write a deliberate choice.
+ */
+export const resolveWithin = (context: Context, target: string, options: GuardOptions = {}) =>
+  Effect.gen(function* () {
+    if (target.trim().length === 0) {
+      return yield* new ToolFailure({ message: "filePath must not be empty." })
+    }
+    const full = resolve(context.directory, target)
+    if (contains(context.directory, full)) return full
+
+    const dir = (options.kind ?? "file") === "directory" ? full : dirname(full)
+    yield* context
+      .ask({
+        permission: "external_directory",
+        patterns: [join(dir, "*")],
+        always: [join(dir, "*")],
+        metadata: { filePath: full, parentDir: dir },
+      })
+      .pipe(
+        Effect.mapError(
+          () =>
+            new ToolFailure({
+              message: `${full} is outside the session directory (${context.directory}) and access was not granted.`,
+            }),
+        ),
+      )
+    return full
+  })

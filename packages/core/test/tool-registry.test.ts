@@ -1,9 +1,12 @@
 import { messageID, sessionID } from "@compass/schema"
 import { describe, expect, test } from "bun:test"
 import { Effect, Schema } from "effect"
-import { make as makeRegistry } from "../src/tool/registry"
+import { make as makeRegistryRaw } from "../src/tool/registry"
 import { MAX_LINES, bound } from "../src/tool/truncate"
 import { ToolFailure, make as makeTool, validName } from "../src/tool/tool"
+
+const allowAll = { ask: () => Effect.void }
+const makeRegistry = (regs: Parameters<typeof makeRegistryRaw>[0]) => makeRegistryRaw(regs, allowAll)
 
 const context = {
   sessionID: sessionID(),

@@ -1,38 +1,49 @@
 import { stat } from "node:fs/promises"
 import path from "node:path"
 import { Effect, Schema } from "effect"
+import { resolveWithin } from "./path-guard"
 import { make, ToolFailure, type Context } from "./tool"
 
 const DEFAULT_LIMIT = 100
-const MAX_LIMIT = 1000
+export const MAX_LIMIT = 1000
 
 /**
  * Sorting by mtime means every match must be stat'd before the limit can be
  * applied, so the walk itself needs a ceiling — otherwise `**` at a filesystem
  * root would stat forever before producing a single line of output.
  */
-const SCAN_CEILING = 10_000
+export const SCAN_CEILING = 10_000
 
 /** Statting is thread-pool bound; batching keeps a big match set off one file descriptor at a time. */
 const STAT_CONCURRENCY = 128
 
 const IGNORED = ["node_modules", ".git", "dist"] as const
 
+/**
+ * A `..` segment walks out of the search root before any guard can inspect the
+ * result, and Bun.Glob ignores `cwd` entirely for an absolute pattern. Both are
+ * matched here — including inside a brace list, where `{..,src}/*` hides one.
+ */
+const ESCAPING_SEGMENT = /(^|[\\/{,])\.\.([\\/},]|$)/
+
 const DESCRIPTION = `Fast file-path search by glob pattern. Reach for this whenever you know something about a file's name or location but not its contents.
 
 - Supports standard glob syntax: "**/*.ts", "src/**/__tests__/*.spec.ts", "*.{json,yaml}", "?" for a single character.
 - Matches paths only, never file contents. To search inside files, use grep instead.
 - Returns absolute paths sorted by modification time, most recently edited first. In an active repository the top handful of results are usually the files the current task is about, so read them in the order given.
-- "path" defaults to the session's working directory. Omit the field to use that default; do not pass the strings "undefined" or "null". A relative path is resolved against the session directory.
-- Directories named node_modules, .git, and dist are skipped, unless your pattern names one of them explicitly (so "node_modules/**/package.json" still works).
+- "path" defaults to the session's working directory. Omit the field to use that default; do not pass the strings "undefined" or "null". A relative path is resolved against the session directory, and a path outside it needs authorization.
+- The pattern is always relative to "path". An absolute pattern or one containing ".." is rejected — put the directory in "path" instead, e.g. path="/etc" with pattern="*.conf".
+- Directories named node_modules, .git, and dist are skipped, unless your pattern names one of them as a whole path segment (so "node_modules/**/package.json" still works, while "dist-utils/*.ts" does not re-enable dist).
 - At most "limit" paths are returned (default ${DEFAULT_LIMIT}). If more files matched, the output says how many — prefer narrowing the pattern or the path over raising the limit.
+- Very broad patterns stop after ${SCAN_CEILING} matches. The output says so, and that sample is an arbitrary slice in directory order rather than the newest files, so narrow the search instead of trusting it.
 - No matches is a normal result, not an error. If a pattern comes back empty, try a broader one before concluding the file does not exist.
 - Calls are cheap: issue several speculative patterns in one turn rather than guessing a single pattern and waiting.
 - For open-ended exploration that will need many rounds of globbing and grepping, delegate to a subagent instead of driving it yourself.`
 
 const Parameters = Schema.Struct({
   pattern: Schema.String.annotate({
-    description: 'The glob pattern to match file paths against, e.g. "**/*.ts" or "src/**/config.*"',
+    description:
+      'The glob pattern to match file paths against, e.g. "**/*.ts" or "src/**/config.*". Must be relative: no leading "/" and no ".." segments.',
   }),
   path: Schema.optionalKey(
     Schema.String.annotate({
@@ -47,6 +58,8 @@ const Parameters = Schema.Struct({
   ),
 })
 
+type Params = typeof Parameters.Type
+
 interface Match {
   readonly file: string
   readonly mtime: number
@@ -56,21 +69,71 @@ interface Scan {
   readonly matches: readonly Match[]
   /** True when the walk stopped at SCAN_CEILING, so `matches` is a floor, not a total. */
   readonly partial: boolean
+  /** Matches that no longer existed by the time they were stat'd. Reported, never dropped in silence. */
+  readonly vanished: number
 }
 
-const statAll = async (files: readonly string[]): Promise<readonly Match[]> => {
+const describe = (cause: unknown) => (cause instanceof Error ? cause.message : String(cause))
+
+const errorCode = (cause: unknown) => {
+  if (typeof cause !== "object" || cause === null || !("code" in cause)) return undefined
+  const code = (cause as { readonly code: unknown }).code
+  return typeof code === "string" ? code : undefined
+}
+
+/**
+ * An unreadable, looping or non-directory path is not an absent one. Reporting
+ * every errno as "does not exist" sends the model looking for a typo instead of
+ * fixing the actual obstacle.
+ */
+const STAT_FAILURES: Readonly<Record<string, string>> = {
+  ENOENT: "does not exist",
+  ENOTDIR: "has a component that is not a directory",
+  EACCES: "cannot be read: permission denied",
+  EPERM: "cannot be read: operation not permitted",
+  ELOOP: "resolves through a symlink loop",
+  ENAMETOOLONG: "is too long for this filesystem to resolve",
+}
+
+const statFailure = (directory: string, cause: unknown) => {
+  const code = errorCode(cause)
+  const reason = code === undefined ? undefined : STAT_FAILURES[code]
+  if (reason !== undefined) return new ToolFailure({ message: `Search path ${directory} ${reason}.` })
+  return new ToolFailure({
+    message: `Search path ${directory} could not be read${code === undefined ? "" : ` (${code})`}: ${describe(cause)}`,
+  })
+}
+
+/**
+ * Segment equality, not substring containment. Patterns like "dist-utils/*.ts" or
+ * one ending in ".gitkeep" merely mention an ignored name, and a mention must not
+ * switch that ignore off for the whole walk.
+ */
+const namesSegment = (pattern: string, name: string) => pattern.split(/[/\\]/).includes(name)
+
+const statAll = async (files: readonly string[], abort: AbortSignal) => {
   const found: Match[] = []
-  for (let i = 0; i < files.length; i += STAT_CONCURRENCY) {
+  let vanished = 0
+  for (let index = 0; index < files.length; index += STAT_CONCURRENCY) {
+    // The stat phase dominates a large match set, so abort is honored per batch
+    // rather than only on the way in.
+    if (abort.aborted) throw new Error("aborted")
     const settled = await Promise.all(
-      files.slice(i, i + STAT_CONCURRENCY).map(async (file) => {
+      files.slice(index, index + STAT_CONCURRENCY).map(async (file) => {
         // A match can vanish between the walk and the stat (build output, git gc).
         const info = await stat(file).catch(() => undefined)
         return info === undefined ? undefined : { file, mtime: info.mtimeMs }
       }),
     )
-    found.push(...settled.filter((entry): entry is Match => entry !== undefined))
+    for (const entry of settled) {
+      if (entry === undefined) {
+        vanished += 1
+        continue
+      }
+      found.push(entry)
+    }
   }
-  return found
+  return { found, vanished }
 }
 
 const scan = async (input: {
@@ -80,7 +143,7 @@ const scan = async (input: {
 }): Promise<Scan> => {
   // Only ignore a directory the caller did not ask for by name, so an explicit
   // "node_modules/**" or "dist/*.js" search still reaches its target.
-  const ignored = new Set<string>(IGNORED.filter((entry) => !input.pattern.includes(entry)))
+  const ignored = new Set<string>(IGNORED.filter((entry) => !namesSegment(input.pattern, entry)))
   const glob = new Bun.Glob(input.pattern)
   const files: string[] = []
   let partial = false
@@ -101,16 +164,24 @@ const scan = async (input: {
     files.push(path.resolve(input.directory, relative))
   }
 
-  return { matches: await statAll(files), partial }
+  const statted = await statAll(files, input.abort)
+  return { matches: statted.found, partial, vanished: statted.vanished }
 }
 
-const resolveDirectory = (input: { readonly path?: string | undefined }, context: Context) =>
+const resolveDirectory = (input: Params, context: Context) =>
   Effect.gen(function* () {
-    const requested = input.path ?? context.directory
-    const directory = path.isAbsolute(requested) ? requested : path.resolve(context.directory, requested)
+    const requested = input.path ?? "."
+    if (requested.trim().length === 0) {
+      return yield* new ToolFailure({
+        message: 'The "path" field must name a directory; omit it to search the session directory.',
+      })
+    }
+    // Containment lives here rather than in the scan: a search root outside the
+    // session directory is authorized once, up front, before anything is listed.
+    const directory = yield* resolveWithin(context, requested, { kind: "directory" })
     const info = yield* Effect.tryPromise({
       try: () => stat(directory),
-      catch: () => new ToolFailure({ message: `Search path does not exist: ${directory}` }),
+      catch: (cause) => statFailure(directory, cause),
     })
     if (!info.isDirectory()) {
       return yield* new ToolFailure({ message: `Search path is not a directory: ${directory}` })
@@ -118,26 +189,35 @@ const resolveDirectory = (input: { readonly path?: string | undefined }, context
     return directory
   })
 
-export const globTool = make({
+export const globTool = make<Params>({
   description: DESCRIPTION,
   input: Parameters,
   permission: "glob",
   execute: (input, context) =>
     Effect.gen(function* () {
+      if (context.abort.aborted) {
+        return yield* new ToolFailure({ message: `Glob search for "${input.pattern}" was aborted before it started.` })
+      }
+      if (path.isAbsolute(input.pattern) || ESCAPING_SEGMENT.test(input.pattern)) {
+        return yield* new ToolFailure({
+          message: `Pattern "${input.pattern}" must be relative to the search directory: it may not start at the filesystem root or contain a ".." segment. Put the directory in "path" and keep the pattern relative, e.g. path="/etc" with pattern="*.conf".`,
+        })
+      }
+
       const directory = yield* resolveDirectory(input, context)
       const limit = input.limit ?? DEFAULT_LIMIT
 
       const result = yield* Effect.tryPromise({
         try: () => scan({ directory, pattern: input.pattern, abort: context.abort }),
         catch: (cause) =>
-          new ToolFailure({
-            message: `Glob search failed for pattern "${input.pattern}" in ${directory}: ${
-              cause instanceof Error ? cause.message : String(cause)
-            }`,
-          }),
+          context.abort.aborted
+            ? new ToolFailure({ message: `Glob search for "${input.pattern}" was aborted before it finished.` })
+            : new ToolFailure({
+                message: `Glob search failed for pattern "${input.pattern}" in ${directory}: ${describe(cause)}`,
+              }),
       })
 
-      const ordered = result.matches.slice().sort((left, right) => right.mtime - left.mtime)
+      const ordered = result.matches.toSorted((left, right) => right.mtime - left.mtime)
       const shown = ordered.slice(0, limit)
       const truncated = ordered.length > limit
       const relative = path.relative(context.directory, directory)
@@ -147,25 +227,38 @@ export const globTool = make({
         matched: ordered.length,
         truncated,
         partialScan: result.partial,
+        vanished: result.vanished,
         directory,
+      }
+
+      const notes: string[] = []
+      if (result.partial) {
+        notes.push(
+          `(Showing ${shown.length} of the first ${ordered.length} matches. The walk stopped at the ${SCAN_CEILING}-match ceiling in directory order, so this is an arbitrary sample of a larger set, not the newest files overall. Narrow the pattern or the path.)`,
+        )
+      }
+      if (!result.partial && truncated) {
+        notes.push(
+          `(Showing the ${shown.length} most recently modified of ${ordered.length} matches. Use a more specific pattern or path.)`,
+        )
+      }
+      if (result.vanished > 0) {
+        notes.push(
+          `(${result.vanished} matched ${result.vanished === 1 ? "path" : "paths"} disappeared before they could be read and ${result.vanished === 1 ? "is" : "are"} not listed.)`,
+        )
       }
 
       if (shown.length === 0) {
         return {
           title,
-          output: `No files matched "${input.pattern}" under ${directory}`,
+          output: [`No files matched "${input.pattern}" under ${directory}`, ...notes].join("\n\n"),
           metadata,
         }
       }
 
-      const total = result.partial ? `${ordered.length}+` : `${ordered.length}`
-      const notice = truncated
-        ? `\n\n(Showing the ${shown.length} most recently modified of ${total} matches. Use a more specific pattern or path.)`
-        : ""
-
       return {
         title,
-        output: shown.map((entry) => entry.file).join("\n") + notice,
+        output: [shown.map((entry) => entry.file).join("\n"), ...notes].join("\n\n"),
         metadata,
       }
     }),

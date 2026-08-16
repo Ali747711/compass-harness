@@ -2,14 +2,16 @@
 // https://github.com/anomalyco/opencode — see licenses/opencode-MIT.txt
 //
 // The ten fallback matching strategies live in ./edit-replacers. This file is only
-// the wrapper: path resolution, line-ending/BOM preservation, and the unified diff
-// the model gets back. opencode's LSP diagnostics, formatter and snapshot hooks are
-// deliberately absent — those services do not exist in this harness yet.
+// the wrapper: path resolution, per-file locking, line-ending/BOM preservation, the
+// atomic write, and the unified diff the model gets back. opencode's LSP diagnostics,
+// formatter and snapshot hooks are deliberately absent — those services do not exist
+// in this harness yet.
 
-import { readFile, stat } from "node:fs/promises"
-import { relative, resolve } from "node:path"
-import { Effect, Schema } from "effect"
+import { access, constants, readFile, realpath, rename, rm, stat, writeFile } from "node:fs/promises"
+import { basename, dirname, join, relative } from "node:path"
+import { Effect, Schema, Semaphore } from "effect"
 import { replace, trimDiff } from "./edit-replacers"
+import { resolveWithin } from "./path-guard"
 import { make, ToolFailure, type Context } from "./tool"
 
 const DESCRIPTION = `Performs exact string replacements in an existing file.
@@ -21,7 +23,8 @@ Usage:
 - Set \`replaceAll: true\` to apply the same substitution everywhere in the file — the right tool for renaming a variable or a symbol.
 - \`newString\` must differ from \`oldString\`. Passing the same text twice is an error, not a no-op. To delete text, pass an empty \`newString\`.
 - The file must already exist and \`oldString\` must be non-empty. Use \`write\` to create a new file or to intentionally replace a whole file.
-- Edits are all-or-nothing. On failure the file is left byte-for-byte untouched and the error says how to recover, so fix the call rather than retrying it unchanged.
+- Edits are all-or-nothing: the new contents are written to a temporary file beside the original and renamed over it, so a failed or interrupted edit leaves the file byte-for-byte untouched and the error says how to recover. Fix the call rather than retrying it unchanged.
+- Matching falls back to increasingly tolerant strategies, so the span actually replaced can be wider than \`oldString\`. When the resulting bytes are identical to what was already on disk the result says so and nothing is written.
 - Prefer editing an existing file over creating a new one. Preserve the file's existing style, indentation and line endings.
 - Do not add comments narrating the edit, and only use emojis if the user explicitly asks for them.
 
@@ -51,6 +54,9 @@ const CONTEXT_LINES = 3
 // Past this the O(n*m) LCS table costs more than an exact diff is worth, so the
 // changed span is reported as one delete/insert pair instead.
 const MAX_DIFF_CELLS = 4_000_000
+// git's marker, emitted as a pseudo-line so that gaining or losing the final
+// newline is a visible change instead of an invisible one.
+const NO_NEWLINE = "\\ No newline at end of file"
 
 type Kind = "equal" | "add" | "remove"
 
@@ -84,11 +90,17 @@ const toLf = (text: string) => text.replaceAll("\r\n", "\n")
 const fromLf = (text: string, ending: "\n" | "\r\n") => (ending === "\n" ? text : text.replaceAll("\n", "\r\n"))
 
 function splitLines(text: string): string[] {
+  if (text === "") return []
   const lines = text.split("\n")
   // A trailing newline yields a final empty element that would render as a bogus
-  // context line; drop it rather than showing it.
-  if (lines.length > 1 && lines[lines.length - 1] === "") lines.pop()
-  return lines
+  // context line, so drop it. Text that does NOT end in one carries an explicit
+  // marker instead: without it "a\nb\n" and "a\nb" diff as identical and a real
+  // write is reported to the model as a no-op.
+  if (lines[lines.length - 1] === "") {
+    lines.pop()
+    return lines
+  }
+  return [...lines, NO_NEWLINE]
 }
 
 function middle(before: readonly string[], after: readonly string[]): Change[] {
@@ -198,6 +210,146 @@ function unified(label: string, before: string, after: string): Patch {
   return { text: trimDiff([`--- ${label}`, `+++ ${label}`, ...hunks].join("\n")), additions, deletions }
 }
 
+// An edit is a read-modify-write spanning several awaits. Two edits to one file
+// would otherwise both read the original and the later write would silently drop
+// the earlier one, so every path gets its own gate.
+const locks = new Map<string, Semaphore.Semaphore>()
+
+function lockFor(filePath: string): Semaphore.Semaphore {
+  const hit = locks.get(filePath)
+  if (hit) return hit
+  const next = Semaphore.makeUnsafe(1)
+  locks.set(filePath, next)
+  return next
+}
+
+const noop = () => undefined
+
+/** Best effort: a leftover temp file must not mask the failure that stranded it. */
+const discard = (temp: string) => Effect.promise(() => rm(temp, { force: true }).then(noop, noop))
+
+/**
+ * Writes beside the original and renames over it. rename(2) is atomic, so a
+ * failure, a full disk or an interruption leaves the previous bytes intact —
+ * which is what the description promises.
+ */
+const writeAtomically = (filePath: string, content: string, mode: number) =>
+  Effect.gen(function* () {
+    // Edit the symlink's target rather than replacing the link with a regular file.
+    const target = yield* Effect.tryPromise({
+      try: () => realpath(filePath),
+      catch: (cause) => new ToolFailure({ message: `Could not resolve ${filePath}: ${describe(cause)}` }),
+    })
+
+    // rename(2) ignores the target's own permissions, so ask first: a read-only
+    // file must stay read-only rather than being quietly replaced.
+    yield* Effect.tryPromise({
+      try: () => access(target, constants.W_OK),
+      catch: () => new ToolFailure({ message: `${filePath} is not writable, so no changes were made.` }),
+    })
+
+    const temp = join(dirname(target), `.${basename(target)}.${process.pid}-${Math.random().toString(36).slice(2, 10)}`)
+    yield* Effect.tryPromise({
+      try: () => writeFile(temp, content, { encoding: "utf-8", mode: mode & 0o777 }),
+      catch: (cause) => new ToolFailure({ message: `Could not write ${filePath}: ${describe(cause)}` }),
+    }).pipe(Effect.onError(() => discard(temp)))
+
+    yield* Effect.tryPromise({
+      try: () => rename(temp, target),
+      catch: (cause) => new ToolFailure({ message: `Could not replace ${filePath}: ${describe(cause)}` }),
+    }).pipe(Effect.onError(() => discard(temp)))
+  })
+
+const apply = (input: Input, context: Context, filePath: string, label: string) =>
+  Effect.gen(function* () {
+    const info = yield* Effect.tryPromise({
+      try: () => stat(filePath),
+      catch: (cause) =>
+        new ToolFailure({
+          message:
+            codeOf(cause) === "ENOENT"
+              ? `File not found: ${filePath}. Check the path, or use write to create it.`
+              : `Could not stat ${filePath}: ${describe(cause)}`,
+        }),
+    })
+    if (info.isDirectory()) return yield* new ToolFailure({ message: `Path is a directory, not a file: ${filePath}` })
+    if (context.abort.aborted) return yield* new ToolFailure({ message: "Edit aborted before the file was read." })
+
+    // node:fs rather than Bun.file().text(), which strips a leading BOM and would
+    // therefore drop it from the file on write-back.
+    const raw = yield* Effect.tryPromise({
+      try: () => readFile(filePath, "utf-8"),
+      catch: (cause) => new ToolFailure({ message: `Could not read ${filePath}: ${describe(cause)}` }),
+    })
+    if (context.abort.aborted) return yield* new ToolFailure({ message: "Edit aborted before it was applied." })
+
+    const hasBom = raw.startsWith(BOM)
+    const before = hasBom ? raw.slice(1) : raw
+    const ending = detectLineEnding(before)
+
+    // Match in the file's own line-ending space so a model that only ever sees
+    // LF text can still edit a CRLF file.
+    const oldString = fromLf(toLf(input.oldString), ending)
+    const newString = fromLf(toLf(input.newString), ending)
+
+    // These messages are tuned to tell the model how to recover; pass them through verbatim.
+    const replaced = yield* Effect.try({
+      try: () => replace(before, oldString, newString, input.replaceAll ?? false),
+      catch: (cause) => new ToolFailure({ message: describe(cause) }),
+    })
+
+    // A newString that reintroduces the BOM must not stack a second one when the
+    // file's own mark is put back below.
+    const after = hasBom && replaced.startsWith(BOM) ? replaced.slice(1) : replaced
+    const next = hasBom ? BOM + after : after
+
+    // The fallback replacers substitute a fuzzy span, not the literal oldString, so
+    // the only trustworthy comparison is the file's bytes before against after.
+    if (next === raw)
+      return {
+        title: label,
+        output:
+          `No change to ${label}: the span that matched is already byte-for-byte identical to newString, ` +
+          `so nothing was written. Re-read the file — the edit you intended may already be applied, or ` +
+          `oldString may have matched somewhere you did not mean.`,
+        metadata: {
+          filePath,
+          diff: "",
+          additions: 0,
+          deletions: 0,
+          replaceAll: input.replaceAll ?? false,
+          changed: false,
+        },
+      }
+
+    if (context.abort.aborted) return yield* new ToolFailure({ message: "Edit aborted before it was written." })
+
+    yield* writeAtomically(filePath, next, info.mode)
+
+    const patch = unified(label, toLf(before), toLf(after))
+    const summary = `Edited ${label} (+${patch.additions} -${patch.deletions})`
+    // The diff is computed on LF-normalized text, so an empty patch after a real
+    // write means the bytes differ only in line endings. Say which, rather than
+    // printing a bare "+0 -0" that reads like nothing happened.
+    const detail =
+      patch.text === ""
+        ? `${summary}\nOnly line endings changed; no line content differs.`
+        : `${summary}\n\n${patch.text}`
+
+    return {
+      title: label,
+      output: detail,
+      metadata: {
+        filePath,
+        diff: patch.text,
+        additions: patch.additions,
+        deletions: patch.deletions,
+        replaceAll: input.replaceAll ?? false,
+        changed: true,
+      },
+    }
+  })
+
 export const editTool = make({
   description: DESCRIPTION,
   input: InputSchema,
@@ -208,63 +360,9 @@ export const editTool = make({
       if (input.filePath.trim() === "")
         return yield* new ToolFailure({ message: "filePath is required and cannot be empty." })
 
-      const filePath = resolve(context.directory, input.filePath)
+      const filePath = yield* resolveWithin(context, input.filePath)
       const label = relative(context.directory, filePath) || filePath
 
-      const info = yield* Effect.tryPromise({
-        try: () => stat(filePath),
-        catch: (cause) =>
-          new ToolFailure({
-            message:
-              codeOf(cause) === "ENOENT"
-                ? `File not found: ${filePath}. Check the path, or use write to create it.`
-                : `Could not stat ${filePath}: ${describe(cause)}`,
-          }),
-      })
-      if (info.isDirectory()) return yield* new ToolFailure({ message: `Path is a directory, not a file: ${filePath}` })
-
-      // node:fs rather than Bun.file().text(), which strips a leading BOM and would
-      // therefore drop it from the file on write-back.
-      const raw = yield* Effect.tryPromise({
-        try: () => readFile(filePath, "utf-8"),
-        catch: (cause) => new ToolFailure({ message: `Could not read ${filePath}: ${describe(cause)}` }),
-      })
-
-      const hasBom = raw.startsWith(BOM)
-      const before = hasBom ? raw.slice(1) : raw
-      const ending = detectLineEnding(before)
-
-      // Match in the file's own line-ending space so a model that only ever sees
-      // LF text can still edit a CRLF file.
-      const oldString = fromLf(toLf(input.oldString), ending)
-      const newString = fromLf(toLf(input.newString), ending)
-
-      // These messages are tuned to tell the model how to recover; pass them through verbatim.
-      const after = yield* Effect.try({
-        try: () => replace(before, oldString, newString, input.replaceAll ?? false),
-        catch: (cause) => new ToolFailure({ message: describe(cause) }),
-      })
-
-      if (context.abort.aborted) return yield* new ToolFailure({ message: "Edit aborted before it was written." })
-
-      yield* Effect.tryPromise({
-        try: () => Bun.write(filePath, hasBom ? BOM + after : after),
-        catch: (cause) => new ToolFailure({ message: `Could not write ${filePath}: ${describe(cause)}` }),
-      })
-
-      const patch = unified(label, toLf(before), toLf(after))
-      const summary = `Edited ${label} (+${patch.additions} -${patch.deletions})`
-
-      return {
-        title: label,
-        output: patch.text === "" ? summary : `${summary}\n\n${patch.text}`,
-        metadata: {
-          filePath,
-          diff: patch.text,
-          additions: patch.additions,
-          deletions: patch.deletions,
-          replaceAll: input.replaceAll ?? false,
-        },
-      }
+      return yield* lockFor(filePath).withPermit(apply(input, context, filePath, label))
     }),
 })

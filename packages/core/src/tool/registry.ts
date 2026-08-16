@@ -1,6 +1,13 @@
 import { Context as EffectContext, Effect, Layer, Result as EffectResult } from "effect"
+import { Permission, type Interface as PermissionService } from "../permission/permission"
 import { bound } from "./truncate"
 import { decode, validName, type Context, type Result, type Tool } from "./tool"
+
+/**
+ * What a caller supplies. `ask` is injected by the registry from the Permission
+ * service, so the runner never touches policy and no tool can bypass it.
+ */
+export type CallContext = Omit<Context, "ask">
 
 export interface Registration {
   readonly name: string
@@ -19,13 +26,13 @@ export interface Interface {
   readonly settle: (input: {
     readonly name: string
     readonly input: unknown
-    readonly context: Context
+    readonly context: CallContext
   }) => Effect.Effect<Settlement>
 }
 
 export class ToolRegistry extends EffectContext.Service<ToolRegistry, Interface>()("compass/ToolRegistry") {}
 
-export function make(registrations: readonly Registration[]): Interface {
+export function make(registrations: readonly Registration[], permission: PermissionService): Interface {
   const byName = new Map<string, Tool<any>>()
   for (const entry of registrations) {
     if (!validName(entry.name)) throw new Error(`Invalid tool name: ${entry.name}`)
@@ -41,8 +48,9 @@ export function make(registrations: readonly Registration[]): Interface {
         const tool = byName.get(input.name)
         if (!tool) return { ok: false as const, error: `Unknown tool: ${input.name}` }
 
+        const context: Context = { ...input.context, ask: permission.ask }
         const settled = yield* decode(tool, input.input).pipe(
-          Effect.flatMap((decoded) => tool.execute(decoded, input.context)),
+          Effect.flatMap((decoded) => tool.execute(decoded, context)),
           Effect.result,
         )
 
@@ -66,4 +74,11 @@ export function make(registrations: readonly Registration[]): Interface {
   }
 }
 
-export const layer = (registrations: readonly Registration[]) => Layer.sync(ToolRegistry, () => make(registrations))
+export const layer = (registrations: readonly Registration[]) =>
+  Layer.effect(
+    ToolRegistry,
+    Effect.gen(function* () {
+      const permission = yield* Permission
+      return make(registrations, permission)
+    }),
+  )

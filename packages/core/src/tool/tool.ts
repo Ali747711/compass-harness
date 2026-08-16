@@ -1,4 +1,5 @@
 import type { MessageID, SessionID } from "@compass/schema"
+import type { PermissionDenied, Request as PermissionRequest } from "../permission/permission"
 import { Data, Effect, JsonSchema, Schema } from "effect"
 
 /**
@@ -8,6 +9,12 @@ import { Data, Effect, JsonSchema, Schema } from "effect"
 export interface Context {
   readonly sessionID: SessionID
   readonly messageID: MessageID
+  /**
+   * Requests authorization before a side effect. Fails when refused, and the
+   * tool must propagate that rather than proceeding. Supplied by the registry
+   * from the Permission service, so a tool never reaches the policy directly.
+   */
+  readonly ask: (request: PermissionRequest) => Effect.Effect<void, PermissionDenied>
   readonly callID: string
   readonly directory: string
   readonly abort: AbortSignal

@@ -1,9 +1,21 @@
 import { MessageID, SessionID } from "@compass/schema"
 import { afterEach, beforeEach, describe, expect, test } from "bun:test"
 import { Effect } from "effect"
-import { mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs"
+import {
+  chmodSync,
+  lstatSync,
+  mkdirSync,
+  mkdtempSync,
+  readFileSync,
+  readdirSync,
+  rmSync,
+  statSync,
+  symlinkSync,
+  writeFileSync,
+} from "node:fs"
 import { tmpdir } from "node:os"
 import { join } from "node:path"
+import { PermissionDenied, type Request as PermissionRequest } from "../src/permission/permission"
 import { editTool } from "../src/tool/edit"
 import type { Context } from "../src/tool/tool"
 
@@ -14,9 +26,23 @@ const context = (overrides: Partial<Context> = {}): Context => ({
   messageID: MessageID.make("msg_edit_test"),
   callID: "call_edit_test",
   directory,
+  ask: () => Effect.void,
   abort: new AbortController().signal,
   ...overrides,
 })
+
+/** A context whose permission answers are recorded, so a tool's asking can be asserted. */
+const recording = (
+  log: PermissionRequest[],
+  answer: (request: PermissionRequest) => Effect.Effect<void, PermissionDenied>,
+) =>
+  context({
+    ask: (request) =>
+      Effect.suspend(() => {
+        log.push(request)
+        return answer(request)
+      }),
+  })
 
 interface Params {
   readonly filePath: string
@@ -188,13 +214,28 @@ describe("editTool", () => {
     expect(read("bom.txt")).toBe("\u{FEFF}1st\nsecond\n")
   })
 
-  test("matches through the indentation-flexible fallback", async () => {
+  // Named for what it actually covers: "return 1" is a literal substring of the
+  // indented line, so SimpleReplacer wins and no fallback is involved.
+  test("matches an exact substring inside an indented line", async () => {
     const filePath = write("indent.ts", "function go() {\n    return 1\n}\n")
 
-    // oldString is dedented relative to the file; the ported replacers recover it.
     await run({ filePath, oldString: "return 1", newString: "return 2" })
 
     expect(read("indent.ts")).toBe("function go() {\n    return 2\n}\n")
+  })
+
+  test("falls back to a tolerant replacer when the model's indentation does not match the file", async () => {
+    const filePath = write("indent-fallback.ts", "function go() {\n    return 1\n}\n")
+
+    // Dedented, so it is not a substring of the file: an exact match cannot succeed
+    // and only a fallback replacer can find this span.
+    await run({
+      filePath,
+      oldString: "function go() {\nreturn 1\n}",
+      newString: "function go() {\n    return 2\n}",
+    })
+
+    expect(read("indent-fallback.ts")).toBe("function go() {\n    return 2\n}\n")
   })
 
   test("deletes text when newString is empty", async () => {
@@ -227,5 +268,137 @@ describe("editTool", () => {
 
     expect(message).toContain("aborted")
     expect(read("aborted.ts")).toBe("const a = 1\n")
+  })
+
+  test("reports the loss of a trailing newline instead of calling the write a no-op", async () => {
+    const filePath = write("eof-drop.txt", "alpha\nbeta\n")
+
+    const result = await run({ filePath, oldString: "beta\n", newString: "beta" })
+
+    expect(read("eof-drop.txt")).toBe("alpha\nbeta")
+    expect(result.output).toContain("No newline at end of file")
+    expect(result.metadata?.["changed"]).toBe(true)
+    expect(result.metadata?.["additions"]).toBe(1)
+  })
+
+  test("reports a newly added trailing newline", async () => {
+    const filePath = write("eof-add.txt", "alpha\nbeta")
+
+    const result = await run({ filePath, oldString: "beta", newString: "beta\n" })
+
+    expect(read("eof-add.txt")).toBe("alpha\nbeta\n")
+    expect(result.output).toContain("No newline at end of file")
+    expect(result.metadata?.["deletions"]).toBe(1)
+  })
+
+  test("reports a replacement that changes no bytes as no change, and leaves the file alone", async () => {
+    // The whitespace-normalizing replacer matches "foo   bar" for "foo bar", and
+    // substituting newString there reproduces the original bytes exactly.
+    const filePath = write("noop.txt", "foo   bar\n")
+
+    const result = await run({ filePath, oldString: "foo bar", newString: "foo   bar" })
+
+    expect(read("noop.txt")).toBe("foo   bar\n")
+    expect(result.output).toContain("No change")
+    expect(result.metadata?.["changed"]).toBe(false)
+    expect(result.metadata?.["additions"]).toBe(0)
+    expect(result.metadata?.["deletions"]).toBe(0)
+  })
+
+  test("does not stack a second byte order mark when newString reintroduces one", async () => {
+    const filePath = write("bom-again.txt", "\u{FEFF}first\nsecond\n")
+
+    await run({ filePath, oldString: "first", newString: "\u{FEFF}1st" })
+
+    expect(read("bom-again.txt")).toBe("\u{FEFF}1st\nsecond\n")
+  })
+
+  test("asks for the external_directory permission before editing outside the session", async () => {
+    const outside = mkdtempSync(join(tmpdir(), "compass-edit-outside-"))
+    const filePath = join(outside, "external.txt")
+    writeFileSync(filePath, "secret\n")
+    const asked: PermissionRequest[] = []
+
+    await run(
+      { filePath, oldString: "secret", newString: "public" },
+      recording(asked, () => Effect.void),
+    )
+
+    expect(asked.map((request) => request.permission)).toContain("external_directory")
+    expect(readFileSync(filePath, "utf-8")).toBe("public\n")
+    rmSync(outside, { recursive: true, force: true })
+  })
+
+  test("does not touch a file outside the session directory when permission is refused", async () => {
+    const outside = mkdtempSync(join(tmpdir(), "compass-edit-denied-"))
+    const filePath = join(outside, "external.txt")
+    writeFileSync(filePath, "secret\n")
+    const asked: PermissionRequest[] = []
+    const deny = (request: PermissionRequest) =>
+      new PermissionDenied({ permission: request.permission, pattern: request.patterns[0] ?? "*" })
+
+    const message = await fail({ filePath, oldString: "secret", newString: "public" }, recording(asked, deny))
+
+    expect(asked).toHaveLength(1)
+    expect(message).toContain("outside the session directory")
+    expect(readFileSync(filePath, "utf-8")).toBe("secret\n")
+    rmSync(outside, { recursive: true, force: true })
+  })
+
+  test("never asks for permission for a file inside the session directory", async () => {
+    const filePath = write("inside.txt", "a\n")
+    const asked: PermissionRequest[] = []
+
+    await run(
+      { filePath, oldString: "a", newString: "b" },
+      recording(asked, () => Effect.void),
+    )
+
+    expect(asked).toEqual([])
+  })
+
+  test("serializes concurrent edits to one file instead of dropping one", async () => {
+    const filePath = write("concurrent.txt", "one\n")
+
+    await Promise.all([
+      run({ filePath, oldString: "one\n", newString: "one\ntwo\n" }),
+      run({ filePath, oldString: "one\n", newString: "one\nthree\n" }),
+    ])
+
+    const content = read("concurrent.txt")
+    expect(content).toContain("two")
+    expect(content).toContain("three")
+  })
+
+  test("keeps the file mode and leaves no temporary files behind", async () => {
+    const filePath = write("mode.txt", "a\n")
+    chmodSync(filePath, 0o640)
+
+    await run({ filePath, oldString: "a", newString: "b" })
+
+    expect(read("mode.txt")).toBe("b\n")
+    expect(statSync(filePath).mode & 0o777).toBe(0o640)
+    expect(readdirSync(directory)).toEqual(["mode.txt"])
+  })
+
+  test("edits a symlink's target rather than replacing the link", async () => {
+    write("target.txt", "a\n")
+    const link = join(directory, "link.txt")
+    symlinkSync(join(directory, "target.txt"), link)
+
+    await run({ filePath: link, oldString: "a", newString: "b" })
+
+    expect(lstatSync(link).isSymbolicLink()).toBe(true)
+    expect(read("target.txt")).toBe("b\n")
+  })
+
+  test.skipIf(process.getuid?.() === 0)("refuses to overwrite a read-only file", async () => {
+    const filePath = write("readonly.txt", "a\n")
+    chmodSync(filePath, 0o444)
+
+    const message = await fail({ filePath, oldString: "a", newString: "b" })
+
+    expect(message).toContain("not writable")
+    expect(read("readonly.txt")).toBe("a\n")
   })
 })
