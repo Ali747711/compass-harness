@@ -8,6 +8,7 @@ import {
 } from "@compass/schema"
 import { jsonSchema, streamText, tool as aiTool, type ModelMessage, type ToolSet } from "ai"
 import { Context, Effect, Layer } from "effect"
+import { prune } from "../context/pipeline"
 import { parseModel, resolveModel, type ModelRef } from "../provider/provider"
 import { ToolRegistry } from "../tool/registry"
 import { parameters } from "../tool/tool"
@@ -140,7 +141,9 @@ export const layer = Layer.effect(
             const result = streamText({
               model: resolveModel(input.ref),
               system: SYSTEM,
-              messages: toModelMessages(history),
+              // Prune tier 1 before the request: old tool results are shortened
+              // outside a protected recent window. A no-op under the threshold.
+              messages: prune(toModelMessages(history)).messages,
               tools: toolSet,
             })
             let text = ""

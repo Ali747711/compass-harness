@@ -83,7 +83,7 @@ today. Will re-scope explicitly if reached.
      `git add .` from being committed. The spill root now writes its own `.gitignore` of `*` on
      creation, so every project is protected, not just this one.
   3. **`Effect.promise` on a rejecting `rm` becomes a defect**, and `Effect.ignore` does not catch
-     defects. A permission error during the retention sweep crashed the CLI *after* the prompt had
+     defects. A permission error during the retention sweep crashed the CLI _after_ the prompt had
      already succeeded. `sweep`/`clear` can no longer fail through any channel.
 
   Two LOW findings left alone deliberately: `stat` vs `lstat` for staleness (spill only ever
