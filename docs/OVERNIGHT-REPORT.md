@@ -5,7 +5,7 @@
 - [x] 1. Tool-output truncation with file spill — `c92b2cf`
 - [x] 2. Compaction tier 1 (prune) — `34394cd`
 - [x] 3. Tool descriptions to .txt files — `5339404`
-- [ ] 4. (stretch) provider coverage hardening
+- [x] 4. (stretch) agent-loop coverage, re-scoped — `92dfa1a`
 
 ## Scope correction (read this first)
 
@@ -173,6 +173,25 @@ That needs a seam first: `run.ts` imports `resolveModel` directly, so no offline
 the loop without a live provider call. `OVERNIGHT.md` forbids live API calls absolutely, so the
 seam is a precondition, not a nicety.
 
+**Task 4 done** — `92dfa1a`, pushed. typecheck 3/3, lint clean, 396 tests (14 new).
+
+`layerWith(resolve)` takes the resolver; `layer = layerWith(resolveModel)` keeps production wiring
+identical. Review verified the seam is behaviour-preserving against the exact pre-diff call site:
+resolution still happens per turn, so a missing API key still surfaces at the same point through
+the same error path.
+
+Review also verified the tests are real by **mutation, not reading** — it forced the loop to stop
+after one turn, and separately made it reuse a stale history snapshot, and each break failed
+exactly the tests naming those behaviours and no others.
+
+Two review items fixed rather than merely noted, both cheap: the mock is now `MockLanguageModelV4`
+(both shipped providers implement v4; the v3 mock only matched through an internal compatibility
+proxy), and harness cleanup runs in a `finally` so a failing assertion no longer leaks a temp
+directory. A `MAX_STEPS` test was added — `scripted()` repeats its last entry, so a single
+tool-call script drives an otherwise endless loop and proves the bound holds at 40.
+
+No provider is contacted anywhere in the suite; it passes with no API key in the environment.
+
 ## Needs review in the morning
 
 - **`Projects/harness` is red on `main`** (24 failures, Bun API mismatch on `toMatchFileSnapshot`).
@@ -180,3 +199,75 @@ seam is a precondition, not a nicety.
   gone green there either.
 - **D2**: tool-output limits are constants + env vars because there is no config system to hang
   them off. If a config layer is planned, this is where it should plug in first.
+
+---
+
+# Morning summary
+
+All four backlog tasks are **done and green**. Nothing is parked on a branch, nothing was skipped.
+
+Final state: `typecheck` 3/3, `lint` clean, **396 tests passing, 0 failing**. Branch
+`location-scoping`, everything pushed.
+
+## What shipped tonight
+
+|     | Commit    |                                                                               |
+| --- | --------- | ----------------------------------------------------------------------------- |
+| 1   | `c92b2cf` | Tool output over budget spills to a readable file; the preview names the path |
+| 2   | `34394cd` | Compaction tier 1 — old tool results pruned outside a protected window        |
+| 3   | `5339404` | Tool descriptions moved to colocated `.txt`, wire text byte-identical         |
+| 4   | `92dfa1a` | Agent loop covered offline behind a `ResolveModel` seam                       |
+| —   | `3dcbea6` | SQLite pragma fix (not a backlog item; found by review, see below)            |
+
+Plus four `docs:` commits keeping this report current. Thirteen commits ahead of `main` in total,
+55 files, +5018/−817 — the earlier ones predate tonight.
+
+## The reviews earned their place
+
+Every task went through the code-reviewer before commit, as `OVERNIGHT.md` requires. It did not
+rubber-stamp anything:
+
+- **Task 1** — found a path traversal via `callID`, which is the _provider's_ `toolCallId` and
+  crosses a trust boundary as a bare string. A `../` in it wrote outside the spill root entirely.
+  Also found that spill was landing unignored in the working tree of whatever project the session
+  ran in, holding raw tool output — a real route to committing secrets.
+- **Task 2** — found the prune trigger was **dead**. It caught this by reading opencode's actual
+  `compaction.ts` and noticing they use two different accumulators, which is why their 20k/40k
+  constants are coherent and my single-accumulator port's were not. I had noticed the numbers
+  looked odd and intended only to note it.
+- **Task 3** — independently reconstructed the pre-refactor description strings with
+  `git show HEAD` rather than trusting my "captured before the move" docstring, then found that
+  four descriptions had frozen live constants that are still interpolated in the parameter schema
+  beside them.
+- **Task 4** — proved the new tests real by breaking the implementation two ways and confirming
+  the right tests failed.
+
+## Needs your eyes
+
+1. **`OVERNIGHT.md` points at the wrong repo.** Line 3 names `/Users/mac/Desktop/Projects/harness`
+   and line 97 forbids edits outside it. That directory exists and matches the task text exactly —
+   `config/schema.ts`, `NESTED_CONFIG_KEYS`, `context/pipeline.ts`, `model/anthropic/client.ts`,
+   ADRs, golden transcripts. The first iteration therefore started there and was fully reverted
+   after you corrected it. Worth fixing the file before the next run.
+2. **That other repo is red on `main`** — 24 failing / 337 passing on a clean checkout. All 13
+   golden-transcript failures share one cause: `expect(...).toMatchFileSnapshot is not a function`,
+   a Bun API mismatch rather than a content diff. It could not have satisfied the "completely
+   green" gate on this machine.
+3. **D2 — there is no config layer.** Both the tool-output budget and the compaction thresholds
+   are env-overridable constants because there is nothing to hang them on. Shaped so a real config
+   layer can supply them without touching call sites; this is the first place one should plug in.
+4. **D1 — nothing was merged to `main`.** `OVERNIGHT.md` says push to main; your stated workflow is
+   PR-per-milestone squashed by you. Merging overnight would take that call away, so everything is
+   on `location-scoping`. Thirteen commits is a lot to review at once — worth splitting.
+5. **A commit message has a wrong number.** `c92b2cf` claims "349 tests passing"; the real figure
+   was 333. `OVERNIGHT.md` forbids force-push in any form, so it could not be amended.
+
+## Deferred, deliberately
+
+- `Spill.clear` is implemented and tested but has no call site — there is no session-close
+  lifecycle yet. The age-based half of the retention rule runs after each prompt.
+- Compaction **tier 2** (LLM summarization) was out of scope by instruction.
+- `estimateMessages` ignores image/file parts and tool-call input, so it under-counts if a tool
+  ever emits attachments. Unreachable today.
+- `prune()`'s outcome is discarded at the call site, so there is no way to observe whether
+  compaction ran on a turn. Worth a debug log when there is somewhere to put one.
