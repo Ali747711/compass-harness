@@ -4,8 +4,22 @@ A terminal AI coding agent harness. No desktop app, no web UI.
 
 ## Status
 
-**M0 — skeleton + streaming.** Session persistence, migrations, and a single-turn
-streaming provider call. The tool loop lands in M1.
+**M1.6 — Location scoping.** Working terminal agent: streaming provider calls, a six-tool loop,
+session persistence, a permission seam, and one memoized service graph per project.
+
+| Milestone                          | State |
+| ---------------------------------- | ----- |
+| M0 skeleton + streaming            | done  |
+| M1 tool loop                       | done  |
+| M1.5 Effect 4 migration            | done  |
+| M1.6 LayerNode + Location scoping  | done  |
+| M1.7 durable events + projector    | next  |
+| M2 durable admission + steer/queue |       |
+| M3 server + worker transport       |       |
+| M4 TUI                             |       |
+| M5 instructions + skills           |       |
+| M6 MCP + permission ruleset        |       |
+| M7 subagents                       |       |
 
 ## Requirements
 
@@ -38,11 +52,17 @@ bun run format      # prettier
 
 ## Packages
 
-| Package           | Owns                                                       | Depends on        |
-| ----------------- | ---------------------------------------------------------- | ----------------- |
-| `@compass/schema` | Effect Schema contracts. No services, no side effects.     | `effect`          |
-| `@compass/core`   | Sessions, storage, providers. Tools/agents/MCP land later. | `@compass/schema` |
-| `@compass/cli`    | Entrypoint.                                                | `@compass/core`   |
+| Package           | Owns                                                                | Depends on        |
+| ----------------- | ------------------------------------------------------------------- | ----------------- |
+| `@compass/schema` | Effect Schema contracts. No services, no side effects.              | `effect`          |
+| `@compass/core`   | Sessions, storage, tools, permissions, providers, Location scoping. | `@compass/schema` |
+| `@compass/cli`    | Entrypoint.                                                         | `@compass/core`   |
+
+### Scoping
+
+`Database`, `Permission` and `SessionStore` are global and built once. `ToolRegistry` and
+`SessionRun` are **Location-scoped**: one memoized service graph per project or worktree, keyed by
+directory, so a single process serves many checkouts. A session's directory selects its Location.
 
 `api`, `server`, and `tui` arrive with the milestones that need them (M3, M3, M4).
 
