@@ -3,7 +3,7 @@
 ## Task status
 
 - [x] 1. Tool-output truncation with file spill — `c92b2cf`
-- [ ] 2. Compaction tier 1 (prune)
+- [x] 2. Compaction tier 1 (prune) — `34394cd`
 - [ ] 3. Tool descriptions to .txt files
 - [ ] 4. (stretch) provider coverage hardening
 
@@ -99,8 +99,43 @@ today. Will re-scope explicitly if reached.
 
 ### 2026-08-17 — iteration 2 (next)
 
-Starting task 2, compaction tier 1 (prune). No `context/pipeline.ts` seam exists here, so it has to
-be created rather than filled in.
+**Task 2 done** — `34394cd`, pushed. typecheck 3/3, lint clean, 355 tests (22 new).
+
+Created the `context/pipeline.ts` seam rather than filling one in; none existed here. `prune()`
+runs before every provider request in `session/run.ts`. Tier 2 (LLM summarization) deliberately
+not implemented, per the task.
+
+Review returned 2 HIGH, both reproduced, both fixed with regression tests:
+
+1. **The trigger was dead.** `shouldCompact` and the protect-window walk both measured the whole
+   conversation, so with `PROTECT` 40k > `TRIGGER` 20k the window could never be exceeded at the
+   moment the trigger fired — nothing pruned until 40k, and the documented threshold was
+   decorative. I had spotted the constants looking inconsistent and intended only to note it. The
+   reviewer went to opencode's `compaction.ts` and found why they are coherent there: **two
+   different accumulators**. The window walks tool output only; the gate measures what is
+   recoverable *outside* it. Ported properly, so the thresholds no longer nest.
+2. **The newest message could be left unprotected.** The boundary advanced only after its break
+   check, so a newest message that alone exceeded the window left the boundary at `messages.length`
+   and protected nothing — truncating the tool result the assistant had just produced, before it
+   could be used. Realistic at defaults with one large file read.
+
+Two MEDIUMs also fixed since they were cheap and real: structured outputs (`json`, `error-json`,
+`content`) are now left alone instead of having `value` rewritten to a string while keeping a type
+promising otherwise; and the already-pruned sentinel is anchored to the end of the text, so genuine
+output containing that string (a grep over the pipeline source produces exactly this) is still
+capped.
+
+A third bug was caught by my own idempotency test before review: `prune()` runs every turn, and a
+pruned result is still over the limit, so each request re-pruned the same block, stacking markers.
+
+Deferred, noted rather than fixed: `estimateMessages` ignores image/file parts and tool-call input,
+so it under-counts if a tool ever emits attachments (unreachable today — `toModelMessages` only
+builds text/tool-call/tool-result). And `prune()`'s outcome (`pruned`, `charsSaved`) is discarded
+at the call site, so there is no way to observe whether compaction ran on a given turn.
+
+### 2026-08-17 — iteration 3 (next)
+
+Starting task 3, tool descriptions to `.txt` files.
 
 ## Needs review in the morning
 
