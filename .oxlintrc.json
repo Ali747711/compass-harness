@@ -1,0 +1,14 @@
+{
+  "$schema": "https://raw.githubusercontent.com/oxc-project/oxc/main/npm/oxlint/configuration_schema.json",
+  "categories": {
+    "correctness": "error",
+    "suspicious": "warn"
+  },
+  "rules": {
+    // Effect uses function* with Effect.gen that does not always yield
+    "require-yield": "off",
+    // Namespace-style module re-exports are the convention here
+    "unicorn/consistent-function-scoping": "off"
+  },
+  "ignorePatterns": ["**/node_modules", "**/dist"]
+}

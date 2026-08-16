@@ -1,0 +1,36 @@
+# Attribution
+
+`compass-harness` ports code from [opencode](https://github.com/anomalyco/opencode), which is MIT
+licensed. The full license text is retained at [licenses/opencode-MIT.txt](licenses/opencode-MIT.txt).
+
+Every ported file carries a header naming its origin:
+
+```ts
+// Ported from opencode (MIT). Source: packages/opencode/src/tool/edit.ts
+// https://github.com/anomalyco/opencode — see licenses/opencode-MIT.txt
+```
+
+## Ported files
+
+| compass-harness | opencode origin | Notes                               |
+| --------------- | --------------- | ----------------------------------- |
+| _none yet_      |                 | First ports land in M1 (tool loop). |
+
+## Planned ports
+
+Recorded here so the list above can be audited against intent.
+
+| Planned target                                    | opencode origin                                       | Rationale                                                                |
+| ------------------------------------------------- | ----------------------------------------------------- | ------------------------------------------------------------------------ |
+| `packages/core/src/tool/edit-replacers.ts`        | `packages/opencode/src/tool/edit.ts:217-737`          | Ten fallback matching strategies; pure functions, no framework coupling. |
+| `packages/core/src/tool/apply-patch-parser.ts`    | `packages/opencode/src/tool/apply_patch.ts`           | Patch format parsing.                                                    |
+| `packages/core/src/tool/truncate.ts`              | `packages/opencode/src/tool/truncate.ts`              | Output bounding.                                                         |
+| `packages/core/src/tool/prompt/*.txt`             | `packages/opencode/src/tool/*.txt`                    | Tuned tool descriptions.                                                 |
+| `packages/core/src/agent/subagent-permissions.ts` | `packages/opencode/src/agent/subagent-permissions.ts` | Subagent permission derivation.                                          |
+| `packages/core/src/tool/prompt/task.txt`          | `packages/opencode/src/tool/task.txt`                 | Subagent delegation prompt.                                              |
+
+## Architectural debt
+
+Design and vocabulary are also drawn from opencode's `AGENTS.md`, `CONTEXT.md`, and `specs/v2/`,
+notably: durable prompt admission separated from execution, steer-vs-queue delivery, Context Epoch
+baselines, the child-session subagent model, and the worker-thread HTTP transport.
