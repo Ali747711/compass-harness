@@ -47,6 +47,23 @@ export function make<A>(config: Tool<A>): Tool<A> {
   return config
 }
 
+/**
+ * Fills {{TOKEN}} placeholders in a description loaded from a .txt file.
+ *
+ * Descriptions live as prose so they are reviewable as prose, but several state
+ * limits that are real constants in the code. Baking the numbers into the text
+ * would create a second source of truth beside the parameter schema, which
+ * still interpolates the live value — so a later change to a constant would
+ * tell the model two different things with nothing to catch it.
+ */
+export function render(text: string, values: Readonly<Record<string, string | number>>) {
+  return text.replace(/\{\{(\w+)\}\}/g, (match, key: string) => {
+    const value = values[key]
+    if (value === undefined) throw new Error(`Unknown description placeholder: ${match}`)
+    return String(value)
+  })
+}
+
 const NAME = /^[A-Za-z][A-Za-z0-9_-]{0,63}$/
 export const validName = (name: string) => NAME.test(name)
 

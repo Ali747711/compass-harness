@@ -113,7 +113,7 @@ Review returned 2 HIGH, both reproduced, both fixed with regression tests:
    decorative. I had spotted the constants looking inconsistent and intended only to note it. The
    reviewer went to opencode's `compaction.ts` and found why they are coherent there: **two
    different accumulators**. The window walks tool output only; the gate measures what is
-   recoverable *outside* it. Ported properly, so the thresholds no longer nest.
+   recoverable _outside_ it. Ported properly, so the thresholds no longer nest.
 2. **The newest message could be left unprotected.** The boundary advanced only after its break
    check, so a newest message that alone exceeded the window left the boundary at `messages.length`
    and protected nothing — truncating the tool result the assistant had just produced, before it

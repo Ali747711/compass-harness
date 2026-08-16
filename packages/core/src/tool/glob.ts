@@ -2,7 +2,8 @@ import { stat } from "node:fs/promises"
 import path from "node:path"
 import { Effect, Schema } from "effect"
 import { resolveWithin } from "./path-guard"
-import { make, ToolFailure, type Context } from "./tool"
+import { make, render as renderDescription, ToolFailure, type Context } from "./tool"
+import DESCRIPTION from "./glob.txt"
 
 const DEFAULT_LIMIT = 100
 export const MAX_LIMIT = 1000
@@ -25,20 +26,6 @@ const IGNORED = ["node_modules", ".git", "dist"] as const
  * matched here — including inside a brace list, where `{..,src}/*` hides one.
  */
 const ESCAPING_SEGMENT = /(^|[\\/{,])\.\.([\\/},]|$)/
-
-const DESCRIPTION = `Fast file-path search by glob pattern. Reach for this whenever you know something about a file's name or location but not its contents.
-
-- Supports standard glob syntax: "**/*.ts", "src/**/__tests__/*.spec.ts", "*.{json,yaml}", "?" for a single character.
-- Matches paths only, never file contents. To search inside files, use grep instead.
-- Returns absolute paths sorted by modification time, most recently edited first. In an active repository the top handful of results are usually the files the current task is about, so read them in the order given.
-- "path" defaults to the session's working directory. Omit the field to use that default; do not pass the strings "undefined" or "null". A relative path is resolved against the session directory, and a path outside it needs authorization.
-- The pattern is always relative to "path". An absolute pattern or one containing ".." is rejected — put the directory in "path" instead, e.g. path="/etc" with pattern="*.conf".
-- Directories named node_modules, .git, and dist are skipped, unless your pattern names one of them as a whole path segment (so "node_modules/**/package.json" still works, while "dist-utils/*.ts" does not re-enable dist).
-- At most "limit" paths are returned (default ${DEFAULT_LIMIT}). If more files matched, the output says how many — prefer narrowing the pattern or the path over raising the limit.
-- Very broad patterns stop after ${SCAN_CEILING} matches. The output says so, and that sample is an arbitrary slice in directory order rather than the newest files, so narrow the search instead of trusting it.
-- No matches is a normal result, not an error. If a pattern comes back empty, try a broader one before concluding the file does not exist.
-- Calls are cheap: issue several speculative patterns in one turn rather than guessing a single pattern and waiting.
-- For open-ended exploration that will need many rounds of globbing and grepping, delegate to a subagent instead of driving it yourself.`
 
 const Parameters = Schema.Struct({
   pattern: Schema.String.annotate({
@@ -190,7 +177,10 @@ const resolveDirectory = (input: Params, context: Context) =>
   })
 
 export const globTool = make<Params>({
-  description: DESCRIPTION,
+  description: renderDescription(DESCRIPTION, {
+    SCAN_CEILING,
+    IGNORED: `${IGNORED.slice(0, -1).join(", ")}, and ${IGNORED.at(-1)}`,
+  }),
   input: Parameters,
   permission: "glob",
   execute: (input, context) =>

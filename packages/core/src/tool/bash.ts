@@ -1,6 +1,8 @@
 import { Effect, Schema } from "effect"
 import { existsSync } from "node:fs"
-import { make, ToolFailure, type Context } from "./tool"
+import { make, render as renderDescription, ToolFailure, type Context } from "./tool"
+import DESCRIPTION from "./bash.txt"
+import { MAX_BYTES, MAX_LINES } from "./truncate"
 
 const DEFAULT_TIMEOUT = 120_000
 const MAX_TIMEOUT = 600_000
@@ -14,41 +16,6 @@ const KILL_GRACE = 2_000
  * nushell would silently break every command the model writes.
  */
 const SHELL = existsSync("/bin/bash") ? "/bin/bash" : "/bin/sh"
-
-const DESCRIPTION = `Executes a bash command in the session's working directory and returns its output.
-
-Each call runs in a fresh non-interactive shell, so nothing carries over between calls: \`cd\`, exported variables, shell functions, and activated virtualenvs are all gone by the next invocation. Chain dependent steps inside a single call (\`cd packages/core && bun test\`) or use absolute paths.
-
-This tool is for terminal operations - git, package managers, build systems, test runners, formatters, docker, gh, and other CLIs. Do NOT use it for file operations; the dedicated tools are faster and give you structured results:
-- Find files: use the glob tool, NOT \`find\` or \`ls\`
-- Search file contents: use the grep tool, NOT \`grep\` or \`rg\`
-- Read files: use the read tool, NOT \`cat\`, \`head\`, or \`tail\`
-- Change files: use the edit or write tool, NOT \`sed\`, \`awk\`, \`echo >\`, or heredocs
-- Tell the user something: say it in your reply, NOT \`echo\`
-
-Before running a command:
-1. If it creates files or directories, confirm the parent directory exists first (\`ls foo\` before \`mkdir foo/bar\`).
-2. Quote every path containing spaces: \`python "/path/with spaces/script.py"\` is correct, \`python /path/with spaces/script.py\` is not.
-3. Prefer non-interactive flags. Stdin is an empty stream, so anything waiting for input reads EOF immediately and may fail or misbehave - pass \`-y\`, \`--yes\`, \`--no-input\`, \`--no-pager\`, \`GIT_TERMINAL_PROMPT=0\` and friends instead of expecting to answer a prompt.
-
-Usage notes:
-- \`command\` is required.
-- \`description\` is required: 5-10 words, active voice, describing what the command does ("Run the core test suite", "Install npm dependencies"). It is shown to the user, not to you.
-- \`timeout\` is in milliseconds. It defaults to ${DEFAULT_TIMEOUT} and is capped at ${MAX_TIMEOUT}; larger values are clamped to the cap. When a command times out it is killed, you receive whatever it printed before the kill, and you should either retry with a larger timeout (if the work is genuinely slow) or rerun it non-interactively (if it was blocked waiting for input).
-- A non-zero exit code is NOT a tool error. You get the output and the exit code back and decide what to do next; read stderr before retrying.
-- stdout and stderr are shown in the order they arrived, with each run of stderr wrapped in \`<stderr>\` tags, so you can see where in the output an error appeared. Ordering between the two streams is approximate for text written to both at the same instant.
-- Output is capped at roughly 2000 lines or 50KB. When a command exceeds that, the beginning and the end are kept and the middle is replaced by a marker saying how much was dropped - the exit code and trailing stderr always survive. If a command is known to be enormously chatty, narrow it at the source with a quieter flag or a more specific target rather than expecting to read all of it.
-- Do not use newlines to separate commands (newlines inside quoted strings are fine). Use \`&&\` when a later command depends on an earlier one succeeding and \`;\` when it does not.
-- Run genuinely independent commands as several parallel tool calls in one message instead of joining them with \`&&\`.
-
-Git and GitHub:
-- Only commit, amend, push, or open PRs when explicitly asked to.
-- Before committing, inspect \`git status\`, \`git diff\`, and \`git log --oneline -10\`; stage only the intended files and never commit secrets.
-- Write a concise commit message matching the repository's existing style.
-- Do not change git config, skip hooks, use interactive \`-i\` flags, force-push, or create empty commits unless explicitly asked to.
-- If a commit fails or a hook rejects it, fix the problem and make a new commit; do not amend the failed one.
-- Before opening a PR, inspect status, diff, remote tracking, recent commits, and the diff against the base branch, and review every commit in the PR rather than only the latest.
-- Use \`gh\` for GitHub work and return the PR URL when you are done.`
 
 const Parameters = Schema.Struct({
   command: Schema.String.annotate({
@@ -248,7 +215,12 @@ function render(outcome: Outcome, timeout: number) {
 }
 
 export const bashTool = make<Parameters>({
-  description: DESCRIPTION,
+  description: renderDescription(DESCRIPTION, {
+    DEFAULT_TIMEOUT,
+    MAX_TIMEOUT,
+    MAX_LINES,
+    MAX_KB: Math.round(MAX_BYTES / 1024),
+  }),
   input: Parameters,
   permission: "bash",
   execute: (input, context) =>
