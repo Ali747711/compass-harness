@@ -82,7 +82,10 @@ const program = Effect.gen(function* () {
       text: (delta) => process.stdout.write(delta),
       // Tool activity goes to stderr so piping stdout still yields clean model text.
       tool: (event) => {
-        if (event.state === "running") return process.stderr.write(`\n  ⋯ ${event.name}\n`)
+        // Emitted the moment the model names the tool, before its arguments have
+        // finished streaming — otherwise nothing is shown for that whole gap.
+        if (event.state === "pending") return process.stderr.write(`\n  ⋯ ${event.name}\n`)
+        if (event.state === "running") return undefined
         const mark = event.state === "error" ? "✗" : "✓"
         process.stderr.write(`  ${mark} ${event.name}${event.title ? ` — ${event.title}` : ""}\n`)
       },

@@ -269,12 +269,31 @@ export const layerWith = (resolve: ResolveModel) =>
               let tokens: Tokens | undefined
               let finish: string | undefined
               const calls: { id: string; name: string; input: unknown; error?: string }[] = []
+              /** Dedupes the pending notice; not every provider emits tool-input-start. */
+              const announced = new Set<string>()
               for await (const part of result.fullStream) {
                 if (part.type === "text-delta") {
                   text += part.text
                   input.sink.text(part.text)
                   continue
                 }
+                // The model has committed to a tool name; the argument JSON is
+                // still streaming. For a large write or edit that gap runs to
+                // seconds, and until now nothing was shown for any of it — the
+                // tool line appeared only once the whole stream had drained.
+                // In-memory and sink-only: persisting here would reintroduce the
+                // retry double-write the comment below exists to prevent.
+                if (part.type === "tool-input-start") {
+                  if (!announced.has(part.id)) {
+                    announced.add(part.id)
+                    input.sink.tool({ name: part.toolName, state: "pending" })
+                  }
+                  continue
+                }
+                // An abort is not an error in the AI SDK — it ends `fullStream`
+                // cleanly, so without this a cancelled turn would look like a
+                // short but successful one and be persisted as a real reply.
+                if (part.type === "abort") throw new Error(part.reason ?? "The turn was aborted")
                 if (part.type === "tool-call") {
                   // The SDK flags a call whose arguments would not parse and
                   // hands back the raw string plus an InvalidToolInputError that

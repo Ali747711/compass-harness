@@ -407,6 +407,64 @@ describe("token accounting", () => {
   })
 })
 
+describe("early tool feedback", () => {
+  /**
+   * `tool-input-start` fires when the model commits to a tool name;
+   * `tool-call` only once the whole argument JSON has streamed and parsed. For
+   * a large edit that gap is seconds, and nothing used to be shown for it.
+   */
+  test("announces the tool before its arguments have finished streaming", async () => {
+    const streamed: Chunk[] = [
+      { type: "tool-input-start", id: "call_1", toolName: "echo" } as Chunk,
+      { type: "tool-input-delta", id: "call_1", delta: '{"value":' } as Chunk,
+      { type: "tool-input-delta", id: "call_1", delta: '"x"}' } as Chunk,
+      { type: "tool-input-end", id: "call_1" } as Chunk,
+      { type: "tool-call", toolCallId: "call_1", toolName: "echo", input: JSON.stringify({ value: "x" }) },
+      finishWith("tool-calls"),
+    ]
+    await withHarness([streamed, text("done")], async (h) => {
+      await prompt(h, "go")
+      const states = h.captured.tools.filter((t) => t.name === "echo").map((t) => t.state)
+      // pending arrives first, and the call still settles normally afterwards.
+      expect(states[0]).toBe("pending")
+      expect(states).toContain("completed")
+    })
+  })
+
+  test("announces at most once per call when the provider also sends deltas", async () => {
+    const streamed: Chunk[] = [
+      { type: "tool-input-start", id: "call_1", toolName: "echo" } as Chunk,
+      { type: "tool-input-start", id: "call_1", toolName: "echo" } as Chunk,
+      { type: "tool-call", toolCallId: "call_1", toolName: "echo", input: JSON.stringify({ value: "x" }) },
+      finishWith("tool-calls"),
+    ]
+    await withHarness([streamed, text("done")], async (h) => {
+      await prompt(h, "go")
+      expect(h.captured.tools.filter((t) => t.state === "pending").length).toBe(1)
+    })
+  })
+
+  /**
+   * The AI SDK ends `fullStream` cleanly on abort rather than throwing, so
+   * without an explicit case a cancelled turn is indistinguishable from a short
+   * successful one — and would be persisted as a real reply.
+   */
+  test("treats an aborted stream as a failure, not a short reply", async () => {
+    const aborted: Chunk[] = [
+      { type: "text-start", id: "t0" },
+      { type: "text-delta", id: "t0", delta: "half a th" },
+      { type: "abort", reason: "user cancelled" } as Chunk,
+    ]
+    const h = harness([aborted])
+    const failure = await prompt(h, "go").then(
+      () => undefined,
+      (error: unknown) => error,
+    )
+    expect(failure).toBeDefined()
+    h.cleanup()
+  })
+})
+
 describe("malformed tool calls", () => {
   /**
    * When the model emits unparsable arguments the SDK hands back the raw
