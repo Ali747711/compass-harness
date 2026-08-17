@@ -3,26 +3,7 @@ import { mkdir, stat } from "node:fs/promises"
 import * as path from "node:path"
 import { contains, resolveWithin } from "./path-guard"
 import { make, ToolFailure, type Context } from "./tool"
-
-const DESCRIPTION = `Writes a file to the local filesystem, creating any missing parent directories.
-
-Usage:
-- \`filePath\` may be absolute, or relative to the session's working directory. Prefer absolute paths.
-- Provide the complete final contents of the file. There is no append mode, no merge, and no placeholder
-  expansion: whatever you pass becomes the entire file.
-- If a file already exists at the path it is overwritten in full. Read it first so you know exactly what you
-  are replacing, and prefer the edit tool when you only need to change part of an existing file.
-- Missing parent directories are created for you, so you never need a separate command to make them.
-- A path that resolves outside the session directory — including one reached through a symlink — needs
-  explicit approval first, and the write fails if approval is refused.
-- Fails if the path names an existing directory, or if a component of the path is a file.
-- ALWAYS prefer editing an existing file over creating a new one. Only create files the task actually needs.
-- NEVER proactively create documentation files (*.md) or README files. Write documentation only when the user
-  explicitly asks for it.
-- Only include emojis if the user explicitly asks for them.
-
-The result reports whether the file was created or overwritten, along with its size, so you can confirm the
-write landed without reading the file back.`
+import DESCRIPTION from "./write.txt"
 
 const Input = Schema.Struct({
   filePath: Schema.String.annotate({

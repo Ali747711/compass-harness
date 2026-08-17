@@ -19,9 +19,25 @@ export interface Client {
 export function open(path: string): Client {
   if (path !== ":memory:") mkdirSync(dirname(path), { recursive: true })
   const raw = new BunDatabase(path, { create: true })
+
+  // Order matters. `journal_mode = WAL` itself takes an exclusive lock, so the
+  // timeout has to exist before it or a second process opening the same file
+  // fails outright instead of waiting.
+  //
+  // 5s matches opencode. Note the cost while we are single-process: bun:sqlite
+  // is synchronous on the one JS thread, so a contended write stalls every
+  // fiber, including provider streaming, for up to that long. Revisit when M3
+  // moves the server into a worker.
+  raw.run("PRAGMA busy_timeout = 5000")
   // WAL keeps readers from blocking the writer, which matters once the server
   // and a foreground drain touch the same file.
   raw.run("PRAGMA journal_mode = WAL")
+  // Set explicitly because enabling WAL silently drops synchronous from FULL to
+  // NORMAL. NORMAL is the value we want and the one opencode chooses — durable
+  // across process crash, and able to lose the last commit only on power loss —
+  // but it should be a stated choice rather than a side effect of WAL.
+  raw.run("PRAGMA synchronous = NORMAL")
+  raw.run("PRAGMA cache_size = -64000")
   raw.run("PRAGMA foreign_keys = ON")
   migrate(raw)
   return { raw, db: drizzle(raw, { schema: tables }) }

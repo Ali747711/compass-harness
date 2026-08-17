@@ -9,7 +9,8 @@ import { Effect, Result, Schema } from "effect"
 import { readdir, stat } from "node:fs/promises"
 import { basename, dirname, extname, isAbsolute, join, relative } from "node:path"
 import { resolveWithin } from "./path-guard"
-import { ToolFailure, make, type Context } from "./tool"
+import { ToolFailure, make, render as renderDescription, type Context } from "./tool"
+import DESCRIPTION from "./read.txt"
 
 const DEFAULT_LIMIT = 2000
 const MAX_LINE_WIDTH = 2000
@@ -22,22 +23,6 @@ const MIN_SUGGESTION_LENGTH = 3
 const SIMILARITY_THRESHOLD = 0.6
 // Above this share of control bytes in the sample, the file is not text worth showing.
 const NON_PRINTABLE_RATIO = 0.3
-
-const DESCRIPTION = `Reads a file from the local filesystem and returns its contents as numbered lines.
-
-Usage:
-- filePath may be absolute, or relative to the session's working directory.
-- Returns up to ${DEFAULT_LIMIT} lines starting at offset. Pass limit to ask for fewer.
-- offset is a 0-based line index: offset 0 starts at the first line, offset 100 starts at line 101. The numbers in the output are always the real 1-based line numbers in the file, so they stay stable no matter which window you request.
-- Each line comes back as \`<line number>: <content>\`. A file containing "foo\\n" is returned as "1: foo".
-- The last line of the output states either that you reached the end of the file, or the exact offset to pass to continue reading.
-- Lines longer than ${MAX_LINE_WIDTH} characters are cut short and marked. Use grep to search minified or generated files instead of reading them.
-- Prefer one wide window over many narrow ones. Re-reading the same file in 30-line slices wastes turns; if you need more context, raise limit.
-- Call this tool in parallel when you already know several files you want to read.
-- Read a file before editing it. Editing contents you have not seen is a guess.
-- Text only. Directories, images, PDFs, archives, and other binary files are refused.
-- A path outside the session's working directory needs permission first.
-- A path that does not exist is an error, and names similar files in the same directory when it can. Use glob when you are unsure of a path.`
 
 const Input = Schema.Struct({
   filePath: Schema.String.annotate({
@@ -280,7 +265,7 @@ const render = (filePath: string, body: string, footer: string) =>
   [`<path>${filePath}</path>`, "<content>", body, "</content>", "", footer].join("\n")
 
 export const readTool = make<Input>({
-  description: DESCRIPTION,
+  description: renderDescription(DESCRIPTION, { DEFAULT_LIMIT, MAX_LINE_WIDTH }),
   input: Input,
   execute: (input, context) =>
     Effect.gen(function* () {

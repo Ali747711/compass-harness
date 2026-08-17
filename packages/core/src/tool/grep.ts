@@ -15,7 +15,8 @@ import { statSync } from "node:fs"
 import { dirname, resolve } from "node:path"
 import { Effect, Option, Schema } from "effect"
 import { resolveWithin } from "./path-guard"
-import { ToolFailure, make, type Context, type Result } from "./tool"
+import { ToolFailure, make, render as renderDescription, type Context, type Result } from "./tool"
+import DESCRIPTION from "./grep.txt"
 
 const DEFAULT_LIMIT = 100
 const MAX_LIMIT = 1000
@@ -31,30 +32,6 @@ const MAX_FALLBACK_FILE_BYTES = 10 * 1024 * 1024
 const SKIPPED_DIRECTORIES = ["node_modules", ".git"] as const
 /** Paths named in a skip note before it collapses into a count. */
 const NOTE_SAMPLE = 5
-
-const DESCRIPTION = `Search file contents with a regular expression.
-
-- Fast content search that works at any codebase size. Uses ripgrep when it is on PATH and an
-  equivalent built-in walk when it is not.
-- Searches file CONTENTS. To find files by name use glob; to open a file you already know use read.
-- Supports full regex syntax (eg. "log.*Error", "function\\s+\\w+", "TODO\\(\\w+\\)"). The pattern is
-  passed through unescaped, so escape any metacharacter you mean literally.
-- "path" scopes the search to a directory or a single file and defaults to the session working
-  directory. Relative paths resolve against it.
-- "include" filters by file glob (eg. "*.ts", "*.{ts,tsx}", "src/**/*.go"). A glob with no slash
-  matches at any depth.
-- "limit" caps returned matches (default ${DEFAULT_LIMIT}). The output states when results were capped, so widen
-  the path or tighten the pattern rather than assuming you saw everything.
-- Results are "path:line:text", grouped per file, most recently modified files first.
-- Directories named ${SKIPPED_DIRECTORIES.join(" and ")} are skipped, unless your include glob names one of them
-  explicitly (so include "node_modules/**/*.js" still works), as are binary files. With ripgrep
-  present, gitignored files are skipped too.
-- Matched lines longer than ${MAX_LINE_CHARS} characters are cut short and marked. A match on a line too long
-  to display at all is still reported as "path:line" with a notice instead of the text.
-- Anything the search could not look at — an unreadable file, or a file too large for the built-in
-  walk — is listed at the end of the output. Absence of matches is never reported over skipped data.
-- Prefer one well-aimed search over many narrow ones. If answering the question needs several rounds
-  of globbing and grepping, delegate the whole search to a subagent instead.`
 
 const Parameters = Schema.Struct({
   pattern: Schema.String.annotate({ description: "The regex pattern to search for in file contents" }),
@@ -407,7 +384,10 @@ const group = (hits: readonly Hit[]) => {
 }
 
 export const grepTool = make<Params>({
-  description: DESCRIPTION,
+  description: renderDescription(DESCRIPTION, {
+    MAX_LINE_CHARS,
+    SKIPPED: SKIPPED_DIRECTORIES.join(" and "),
+  }),
   input: Parameters,
   execute: (input, context: Context): Effect.Effect<Result, ToolFailure> =>
     Effect.gen(function* () {

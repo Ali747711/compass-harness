@@ -13,22 +13,7 @@ import { Effect, Schema, Semaphore } from "effect"
 import { replace, trimDiff } from "./edit-replacers"
 import { resolveWithin } from "./path-guard"
 import { make, ToolFailure, type Context } from "./tool"
-
-const DESCRIPTION = `Performs exact string replacements in an existing file.
-
-Usage:
-- Read the file with the \`read\` tool before editing it, in this conversation, so that \`oldString\` matches the bytes actually on disk. Editing from memory is the most common cause of a failed edit.
-- \`oldString\` must reproduce the file EXACTLY: same whitespace, same indentation, same line endings. When copying out of \`read\` output, drop the line-number prefix (\`<number>: \`) — everything after that first space is real file content, and no part of the prefix belongs in \`oldString\` or \`newString\`.
-- \`oldString\` must be unique in the file unless \`replaceAll\` is true. If it matches more than once the edit fails and nothing is written; add surrounding lines until the match is unique, or set \`replaceAll\`.
-- Set \`replaceAll: true\` to apply the same substitution everywhere in the file — the right tool for renaming a variable or a symbol.
-- \`newString\` must differ from \`oldString\`. Passing the same text twice is an error, not a no-op. To delete text, pass an empty \`newString\`.
-- The file must already exist and \`oldString\` must be non-empty. Use \`write\` to create a new file or to intentionally replace a whole file.
-- Edits are all-or-nothing: the new contents are written to a temporary file beside the original and renamed over it, so a failed or interrupted edit leaves the file byte-for-byte untouched and the error says how to recover. Fix the call rather than retrying it unchanged.
-- Matching falls back to increasingly tolerant strategies, so the span actually replaced can be wider than \`oldString\`. When the resulting bytes are identical to what was already on disk the result says so and nothing is written.
-- Prefer editing an existing file over creating a new one. Preserve the file's existing style, indentation and line endings.
-- Do not add comments narrating the edit, and only use emojis if the user explicitly asks for them.
-
-Returns a unified diff of what changed.`
+import DESCRIPTION from "./edit.txt"
 
 const InputSchema = Schema.Struct({
   filePath: Schema.String.annotate({

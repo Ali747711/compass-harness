@@ -11,8 +11,20 @@
 // framing (a pagination hint, an exit code, a stderr block) at the end of its
 // output and still have the model see it.
 
-export const MAX_LINES = 2000
-export const MAX_BYTES = 50 * 1024
+function envInt(name: string, fallback: number) {
+  const raw = process.env[name]
+  if (raw === undefined) return fallback
+  const value = Number.parseInt(raw, 10)
+  return Number.isFinite(value) && value > 0 ? value : fallback
+}
+
+/**
+ * Overridable by environment until a real config layer exists. Kept as a
+ * function of the environment rather than a frozen constant so a later config
+ * layer can supply limits without changing any call site.
+ */
+export const MAX_LINES = envInt("COMPASS_TOOL_OUTPUT_MAX_LINES", 2000)
+export const MAX_BYTES = envInt("COMPASS_TOOL_OUTPUT_MAX_BYTES", 50 * 1024)
 
 /** Reserved for the marker and its blank-line padding. */
 const MARKER_RESERVE = 4
@@ -22,6 +34,8 @@ export interface Options {
   readonly maxBytes?: number
   /** Marker placed between the kept head and tail. */
   readonly marker?: string
+  /** Appended to the marker. Used to name the spill file holding the full text. */
+  readonly note?: string
 }
 
 export type Result =
@@ -87,6 +101,14 @@ function lineCount(text: string) {
   return count
 }
 
+/** True when `text` would be bounded. Lets a caller spill before bounding. */
+export function exceeds(text: string, options: Options = {}) {
+  return (
+    lineCount(text) > (options.maxLines ?? MAX_LINES) ||
+    Buffer.byteLength(text, "utf-8") > (options.maxBytes ?? MAX_BYTES)
+  )
+}
+
 /**
  * Bounds text to whichever limit is reached first, keeping the beginning and the
  * end. Tools must not call this themselves — the registry is the single bounding
@@ -103,7 +125,8 @@ export function bound(text: string, options: Options = {}): Result {
   const byLines = totalLines > maxLines
   const removed = byLines ? totalLines - maxLines : totalBytes - maxBytes
   const unit = byLines ? "lines" : "bytes"
-  const marker = options.marker ?? `...${removed} ${unit} truncated...`
+  const base = options.marker ?? `...${removed} ${unit} truncated...`
+  const marker = options.note === undefined ? base : `${base}\n${options.note}`
   const markerBytes = Buffer.byteLength(marker, "utf-8")
 
   // Degenerate budgets cannot fit both the marker and any content.
