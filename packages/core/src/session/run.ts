@@ -708,10 +708,16 @@ export const layerWith = (resolve: ResolveModel) =>
             // retry re-sends the same oversized input — this retries a *smaller*
             // one, which is a different thing.
             const outcome = yield* Effect.result(runTurn(turn))
-            // Counted before the recovery branch, and again after it. Every
-            // provider call has to charge against the cap or the cap is not one:
-            // a session that overflows on each pass would otherwise get two
-            // calls per iteration and reach 2 × MAX_STEPS.
+            // Counted before the recovery branch, and again after it, so both
+            // the failed turn and its retry charge against the cap — otherwise
+            // a session overflowing on every pass gets two turns per iteration
+            // and reaches 2 × MAX_STEPS worth of work.
+            //
+            // Summarizer calls are deliberately NOT charged. The cap bounds
+            // agent steps, not provider calls; charging compaction would give an
+            // overflowing session fewer real steps than a clean one, and in the
+            // recovery branch could trip the break below immediately after
+            // paying for a summary — abandoning the turn having gained nothing.
             step++
             if (outcome._tag === "Failure") {
               const failure = outcome.failure
@@ -728,6 +734,16 @@ export const layerWith = (resolve: ResolveModel) =>
             const history = yield* store.messages(input.sessionID)
             const tokens = history.at(-1)?.info.tokens
             if (isOverflow({ tokens, limit: modelLimit(ref) })) yield* compact(turn)
+          }
+
+          // Hitting the cap mid-task looks exactly like finishing: the loop
+          // returns, the CLI exits 0, and the reply simply stops. Say so, the
+          // same way a truncated reply is reported.
+          if (needsContinuation && step >= MAX_STEPS) {
+            input.sink.incomplete({
+              reason: "step-limit",
+              detail: `the turn reached its limit of ${MAX_STEPS} steps and stopped before finishing`,
+            })
           }
         })
 

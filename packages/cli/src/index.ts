@@ -66,6 +66,14 @@ const program = Effect.gen(function* () {
   }
 
   const text = positionals.join(" ")
+  // An empty prompt reaches the provider as either "messages must not be empty"
+  // or, on an existing session, a conversation ending on an assistant turn —
+  // which Anthropic treats as a prefill to continue. Neither is what anyone
+  // typing `compass ""` meant, and both cost a call to find out.
+  if (text.trim().length === 0) {
+    process.stderr.write("Nothing to send — the prompt is empty.\n")
+    process.exit(1)
+  }
   const session = values.session
     ? yield* store.get(SessionID.make(values.session))
     : yield* store.create({ title: text.slice(0, 60), directory: process.cwd() })

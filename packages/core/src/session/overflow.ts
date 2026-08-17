@@ -32,6 +32,12 @@ export function usable(limit: ModelLimit): number {
  * Whether the last turn's real usage has reached the point where the next
  * request would not fit.
  *
+ * Known imprecision, in both directions and deliberately not corrected: the
+ * last turn's usage includes reasoning tokens that are never replayed, so it
+ * over-counts, and it excludes the next user message, so it under-counts. It is
+ * a trigger for a recoverable action, not an accounting figure — being early is
+ * cheap and being late costs a failed request.
+ *
  * This reads the provider's own count rather than an estimate. The estimate in
  * ../context/pipeline is good enough to decide which old tool output to shrink;
  * it is not good enough to decide that a conversation must be summarized, where

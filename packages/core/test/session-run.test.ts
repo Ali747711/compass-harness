@@ -275,6 +275,26 @@ describe("the agent loop", () => {
     })
   })
 
+  /**
+   * Reaching the cap mid-task is indistinguishable from finishing — the loop
+   * returns, the CLI exits 0, the reply just stops. The same silent-completion
+   * shape as a truncated reply, so it is reported the same way.
+   */
+  test("says so when it stops at the step limit rather than finishing", async () => {
+    await withHarness([callTool("echo", { value: "x" })], async (h) => {
+      await prompt(h, "go forever")
+      expect(h.captured.incomplete.at(-1)?.reason).toBe("step-limit")
+      expect(h.captured.incomplete.at(-1)?.detail).toContain("40")
+    })
+  })
+
+  test("stays quiet about the step limit on a turn that finished normally", async () => {
+    await withHarness([text("done")], async (h) => {
+      await prompt(h, "hi")
+      expect(h.captured.incomplete).toEqual([])
+    })
+  })
+
   test("bounds a model that requests a tool forever", async () => {
     // scripted() repeats its last entry, so a single tool-call script drives an
     // otherwise endless loop. MAX_STEPS is the only thing that stops it.
