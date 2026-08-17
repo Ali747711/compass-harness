@@ -60,6 +60,17 @@ describe("serialize", () => {
     expect(rendered.length).toBeLessThan(3_000)
   })
 
+  /**
+   * Reasoning is stored but never replayed, so it was never in the context this
+   * summary shrinks. Feeding it to the summarizer would inflate the prompt with
+   * content that costs nothing — and reasoning often exceeds the reply, so it
+   * could push past summaryFits and disable compaction altogether.
+   */
+  test("leaves reasoning out, since it never reached the provider", () => {
+    const reasoning: Part = { id: partID(), ...ids, type: "reasoning", text: "a long internal monologue" }
+    expect(serialize(assistant(reasoning, text("the answer")))).toBe("[Assistant]: the answer")
+  })
+
   test("renders nothing for a message with no content", () => {
     expect(serialize(assistant())).toBe("")
   })

@@ -103,7 +103,13 @@ export function serialize(entry: Entry): string {
   return entry.parts
     .flatMap((part) => {
       if (part.type === "text") return part.text ? [`[Assistant]: ${part.text}`] : []
-      if (part.type === "reasoning") return part.text ? [`[Assistant reasoning]: ${part.text}`] : []
+      // Skipped on purpose, diverging from opencode. Reasoning is stored but
+      // never sent to the provider (see toModelMessages), so it was never in the
+      // context this summary exists to shrink. Including it would feed the
+      // summarizer content that costs nothing today — and reasoning often runs
+      // longer than the reply, so it could push the summary prompt past
+      // summaryFits and switch compaction off entirely.
+      if (part.type === "reasoning") return []
       if (part.type !== "tool") return []
       const tool = part as ToolPart
       const input = typeof tool.input === "string" ? tool.input : JSON.stringify(tool.input ?? {})

@@ -126,7 +126,8 @@ function harness(turns: readonly Chunk[][], override?: MockLanguageModelV4) {
     retries: { attempt: number; message: string }[]
     compactions: { state: string; reason?: string }[]
     incomplete: { reason: string; detail: string }[]
-  } = { text: [], tools: [], retries: [], compactions: [], incomplete: [] }
+    reasoning: string[]
+  } = { text: [], tools: [], retries: [], compactions: [], incomplete: [], reasoning: [] }
   const sink = {
     text: (delta: string) => captured.text.push(delta),
     tool: (event: { name: string; state: string }) => captured.tools.push({ name: event.name, state: event.state }),
@@ -134,6 +135,7 @@ function harness(turns: readonly Chunk[][], override?: MockLanguageModelV4) {
       captured.retries.push({ attempt: attempt.attempt, message: attempt.message }),
     compaction: (event: { state: string; reason?: string }) => captured.compactions.push(event),
     incomplete: (event: { reason: string; detail: string }) => captured.incomplete.push(event),
+    reasoning: (delta: string) => captured.reasoning.push(delta),
   }
   const layers = layerWith(() => model as never).pipe(
     Layer.provideMerge(
@@ -403,6 +405,113 @@ describe("token accounting", () => {
     const history = await prompt(h, "hi")
 
     expect(history[1]!.info.tokens).toBeUndefined()
+    h.cleanup()
+  })
+})
+
+describe("reasoning and block order", () => {
+  const reasoningTurn: Chunk[] = [
+    { type: "reasoning-start", id: "r0", providerMetadata: { openai: { itemId: "rs_1" } } } as Chunk,
+    { type: "reasoning-delta", id: "r0", delta: "let me check the file" } as Chunk,
+    { type: "reasoning-delta", id: "r0", delta: " first", providerMetadata: { openai: { encrypted: "abc" } } } as Chunk,
+    { type: "reasoning-end", id: "r0" } as Chunk,
+    { type: "text-start", id: "t0" },
+    { type: "text-delta", id: "t0", delta: "Checking." },
+    { type: "text-end", id: "t0" },
+    finish,
+  ]
+
+  test("stores reasoning, which nothing used to write at all", async () => {
+    const h = harness([reasoningTurn])
+    const history = await prompt(h, "hi")
+
+    const reasoning = history.flatMap((e) => e.parts).find((p) => p.type === "reasoning") as
+      { text: string; metadata?: Record<string, unknown> } | undefined
+    expect(reasoning?.text).toBe("let me check the file first")
+    h.cleanup()
+  })
+
+  /** Merged, not replaced: providers deliver metadata in pieces across a block. */
+  test("merges provider metadata arriving across start and deltas", async () => {
+    const h = harness([reasoningTurn])
+    const history = await prompt(h, "hi")
+
+    const reasoning = history.flatMap((e) => e.parts).find((p) => p.type === "reasoning") as {
+      metadata?: Record<string, unknown>
+    }
+    expect(reasoning.metadata?.["openai"]).toMatchObject({ itemId: "rs_1", encrypted: "abc" })
+    h.cleanup()
+  })
+
+  test("shows reasoning as it arrives so the terminal is not silent", async () => {
+    const h = harness([reasoningTurn])
+    await prompt(h, "hi")
+    expect(h.captured.reasoning.join("")).toBe("let me check the file first")
+    h.cleanup()
+  })
+
+  /**
+   * Not replayed: sending it back is provider-specific and fails quietly when
+   * done wrong. Omitting it costs tokens, not correctness.
+   */
+  test("does not replay reasoning to the provider", async () => {
+    const h = harness([reasoningTurn, text("second")])
+    await h.run(
+      Effect.gen(function* () {
+        const store = yield* SessionStore
+        const session = yield* store.create({ title: "t", directory: h.directory })
+        const runner = yield* SessionRun
+        yield* runner.prompt({ sessionID: session.id, text: "one", sink: h.sink })
+        yield* runner.prompt({ sessionID: session.id, text: "two", sink: h.sink })
+      }),
+    )
+    expect(JSON.stringify(h.script.prompts.at(-1))).not.toContain("let me check the file")
+    h.cleanup()
+  })
+
+  /**
+   * Part ids are monotonic ULIDs and parts are read back sorted by id. Tool ids
+   * used to be minted at settle time, after the stream, so every tool part
+   * sorted after every text part — a turn that called a tool and *then*
+   * explained itself was replayed the other way round.
+   */
+  test("keeps a tool call before the text that followed it", async () => {
+    const interleaved: Chunk[] = [
+      { type: "tool-call", toolCallId: "call_1", toolName: "echo", input: JSON.stringify({ value: "x" }) },
+      { type: "text-start", id: "t0" },
+      { type: "text-delta", id: "t0", delta: "and here is why" },
+      { type: "text-end", id: "t0" },
+      finishWith("tool-calls"),
+    ]
+    const h = harness([interleaved, text("done")])
+    const history = await prompt(h, "go")
+
+    const kinds = history[1]!.parts.map((part) => part.type)
+    expect(kinds.indexOf("tool")).toBeLessThan(kinds.indexOf("text"))
+
+    // And the rebuilt provider message preserves it.
+    const assistant = toModelMessages(history).find((m) => m.role === "assistant") as {
+      content: { type: string }[]
+    }
+    const types = assistant.content.map((c) => c.type)
+    expect(types.indexOf("tool-call")).toBeLessThan(types.indexOf("text"))
+    h.cleanup()
+  })
+
+  test("keeps separate text blocks separate rather than concatenating them", async () => {
+    const twoBlocks: Chunk[] = [
+      { type: "text-start", id: "t0" },
+      { type: "text-delta", id: "t0", delta: "first block" },
+      { type: "text-end", id: "t0" },
+      { type: "text-start", id: "t1" },
+      { type: "text-delta", id: "t1", delta: "second block" },
+      { type: "text-end", id: "t1" },
+      finish,
+    ]
+    const h = harness([twoBlocks])
+    const history = await prompt(h, "hi")
+    const texts = history[1]!.parts.filter((p) => p.type === "text").map((p) => (p as { text: string }).text)
+    expect(texts).toEqual(["first block", "second block"])
     h.cleanup()
   })
 })

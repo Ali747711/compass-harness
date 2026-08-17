@@ -2,6 +2,7 @@ import {
   INCOMPLETE_FINISH,
   partID as newPartID,
   type CompactionPart,
+  type PartID,
   type MessageID,
   type Part,
   type SessionID,
@@ -42,6 +43,11 @@ export interface Sink {
    * the retry replays the turn, so any text already streamed will appear twice
    * unless something marks the boundary.
    */
+  /**
+   * The model is thinking. Reasoning models can spend a long time here emitting
+   * nothing else, and without this the terminal looks hung.
+   */
+  readonly reasoning: (delta: string) => void
   readonly retry: (attempt: Attempt) => void
   /**
    * The conversation is being summarized. Worth saying out loud: it costs a
@@ -98,6 +104,37 @@ export class SessionRun extends Context.Service<SessionRun, Interface>()("compas
  */
 export type ResolveModel = (ref: ModelRef) => LanguageModel
 
+/** One emitted block of a turn, in the order the model produced it. */
+type Block =
+  | { kind: "text" | "reasoning"; text: string; metadata?: Record<string, unknown> }
+  | { kind: "tool"; callID: string; name: string; input: unknown; error?: string }
+
+const isRecord = (value: unknown): value is Record<string, unknown> =>
+  typeof value === "object" && value !== null && !Array.isArray(value)
+
+const asRecord = (value: unknown) => (isRecord(value) ? value : undefined)
+
+/**
+ * Merges provider metadata one level into the provider namespace.
+ *
+ * Providers deliver a block's metadata in pieces — OpenAI sends the item id on
+ * `reasoning-start` and the encrypted content on a later delta, both under
+ * `openai`. A top-level spread replaces that whole namespace and keeps only
+ * whichever arrived last. opencode replaces wholesale (processor.ts:298) and
+ * gets away with it because Anthropic happens to send metadata only once.
+ */
+function mergeMetadata(
+  current: Record<string, unknown> | undefined,
+  incoming: Record<string, unknown>,
+): Record<string, unknown> {
+  const merged: Record<string, unknown> = { ...current }
+  for (const [namespace, value] of Object.entries(incoming)) {
+    const existing = merged[namespace]
+    merged[namespace] = isRecord(existing) && isRecord(value) ? { ...existing, ...value } : value
+  }
+  return merged
+}
+
 /** The most useful line an unknown thrown value has to offer. */
 const errorText = (cause: unknown) =>
   cause instanceof Error ? cause.message : typeof cause === "string" ? cause : "the model sent an unparsable tool call"
@@ -142,26 +179,44 @@ export function toModelMessages(history: readonly HistoryEntry[]): ModelMessage[
   }
 
   for (const entry of entries) {
-    const text = entry.parts
-      .filter((part): part is TextPart => part.type === "text")
-      .map((part) => part.text)
-      .join("")
     const tools = entry.parts.filter((part): part is ToolPart => part.type === "tool")
 
     if (entry.info.role === "user") {
+      const text = entry.parts
+        .filter((part): part is TextPart => part.type === "text")
+        .map((part) => part.text)
+        .join("")
       if (text.length > 0) messages.push({ role: "user", content: text })
       continue
     }
 
+    // Walked in stored order, which is emitted order, so a turn that reasoned,
+    // called a tool, then explained itself is replayed that way round. The old
+    // version partitioned into "all text" then "all calls", which happened to
+    // match how ids sorted and so hid the reordering rather than avoiding it.
     const content: Extract<ModelMessage, { role: "assistant" }>["content"] = []
-    if (text.length > 0) content.push({ type: "text", text })
-    for (const part of tools) {
-      // A malformed call has the raw argument *string* as its input. Replaying
-      // that produces a tool_use whose input is not an object, which providers
-      // reject — and the store has no delete, so it would be permanent. The SDK
-      // guards the same case when it rebuilds history.
-      const input = typeof part.input === "object" && part.input !== null ? part.input : {}
-      content.push({ type: "tool-call", toolCallId: part.callID, toolName: part.tool, input })
+    for (const part of entry.parts) {
+      if (part.type === "text") {
+        if (part.text.length > 0) content.push({ type: "text", text: part.text })
+        continue
+      }
+      if (part.type === "tool") {
+        // A malformed call has the raw argument *string* as its input. Replaying
+        // that produces a tool_use whose input is not an object, which providers
+        // reject — and the store has no delete, so it would be permanent. The SDK
+        // guards the same case when it rebuilds history.
+        const input = typeof part.input === "object" && part.input !== null ? part.input : {}
+        content.push({ type: "tool-call", toolCallId: part.callID, toolName: part.tool, input })
+      }
+      // Reasoning is stored and displayed but deliberately not replayed.
+      //
+      // Sending it back is provider-specific and fails quietly when done wrong:
+      // an unsigned Anthropic thinking block is dropped with a warning rather
+      // than an error, and OpenAI wants its encrypted content under
+      // `providerOptions` on a Responses request. Neither can be verified
+      // without a live call, and the cost of omitting it is that the model
+      // reasons afresh — tokens, not correctness. Revisit with a real provider
+      // to exercise it against.
     }
     if (content.length > 0) messages.push({ role: "assistant", content })
 
@@ -265,18 +320,65 @@ export const layerWith = (resolve: ResolveModel) =>
                 // this replaces a duplicate log rather than swallowing anything.
                 onError: () => {},
               })
-              let text = ""
               let tokens: Tokens | undefined
               let finish: string | undefined
-              const calls: { id: string; name: string; input: unknown; error?: string }[] = []
+              /**
+               * Blocks in the order the model emitted them. A turn is genuinely
+               * ordered — reason, call a tool, then explain — and flattening it
+               * into "all the text" plus "all the calls" loses that.
+               */
+              const blocks: Block[] = []
+              /** SDK block id → index in `blocks`, for routing deltas. */
+              const open = new Map<string, number>()
               /** Dedupes the pending notice; not every provider emits tool-input-start. */
               const announced = new Set<string>()
+
+              const openBlock = (kind: "text" | "reasoning", id: string, metadata?: Record<string, unknown>) => {
+                const existing = open.get(id)
+                if (existing !== undefined) return existing
+                const index = blocks.push({ kind, text: "", ...(metadata === undefined ? {} : { metadata }) }) - 1
+                open.set(id, index)
+                return index
+              }
+
+              const append = (kind: "text" | "reasoning", id: string, delta: string, metadata?: unknown) => {
+                // Belt and braces. The SDK rejects a delta whose block was never
+                // opened before it reaches us ("text part <id> not found"), so
+                // this cannot currently fire — but opening lazily costs nothing
+                // and loses no text, where opencode drops it (processor.ts:296).
+                const block = blocks[openBlock(kind, id)]
+                if (block === undefined || block.kind === "tool") return
+                block.text += delta
+                if (isRecord(metadata)) block.metadata = mergeMetadata(block.metadata, metadata)
+              }
+
               for await (const part of result.fullStream) {
+                if (part.type === "text-start") {
+                  openBlock("text", part.id)
+                  continue
+                }
                 if (part.type === "text-delta") {
-                  text += part.text
+                  append("text", part.id, part.text, part.providerMetadata)
                   input.sink.text(part.text)
                   continue
                 }
+                // Reasoning is stored and shown but never replayed — see
+                // toModelMessages. Metadata is merged rather than replaced
+                // because providers deliver it in pieces across the block.
+                if (part.type === "reasoning-start") {
+                  openBlock("reasoning", part.id, asRecord(part.providerMetadata))
+                  continue
+                }
+                if (part.type === "reasoning-delta") {
+                  append("reasoning", part.id, part.text, part.providerMetadata)
+                  input.sink.reasoning(part.text)
+                  continue
+                }
+                if (part.type === "reasoning-end") {
+                  append("reasoning", part.id, "", part.providerMetadata)
+                  continue
+                }
+                if (part.type === "text-end") continue
                 // The model has committed to a tool name; the argument JSON is
                 // still streaming. For a large write or edit that gap runs to
                 // seconds, and until now nothing was shown for any of it — the
@@ -301,8 +403,9 @@ export const layerWith = (resolve: ResolveModel) =>
                   // would discard that for a vaguer decoder message and cost a
                   // pointless dispatch for what may be a hallucinated tool.
                   const invalid = part.invalid === true
-                  calls.push({
-                    id: part.toolCallId,
+                  blocks.push({
+                    kind: "tool",
+                    callID: part.toolCallId,
                     name: part.toolName,
                     input: part.input,
                     ...(invalid ? { error: errorText(part.error) } : {}),
@@ -324,7 +427,7 @@ export const layerWith = (resolve: ResolveModel) =>
                 if (part.type === "error")
                   throw part.error instanceof Error ? part.error : new Error(String(part.error))
               }
-              return { text, calls, tokens, finish }
+              return { blocks, tokens, finish }
             },
             catch: (cause) => (cause instanceof Error ? cause : new Error(String(cause))),
           }).pipe(
@@ -348,15 +451,40 @@ export const layerWith = (resolve: ResolveModel) =>
             ),
           )
 
-          if (turn.text.length > 0) {
+          // IDs are minted here, in block order, and never during the stream.
+          // Part IDs are monotonic ULIDs and both parts and messages are read
+          // back sorted by id, so minting in order is what makes stored order
+          // equal emitted order. Minting tool IDs later — as this did until now,
+          // inside settleCalls — sorted every tool part after every text part
+          // and silently reordered the turn.
+          const ordered = turn.blocks.map((block) => ({ ...block, partID: newPartID() }))
+
+          for (const block of ordered) {
+            if (block.kind === "tool") continue
+            if (block.text.length === 0) continue
             yield* store.putPart({
-              id: newPartID(),
+              id: block.partID,
               messageID: assistant.id,
               sessionID: input.sessionID,
-              type: "text",
-              text: turn.text,
+              type: block.kind,
+              text: block.text,
+              ...(block.kind === "reasoning" && block.metadata !== undefined ? { metadata: block.metadata } : {}),
             })
           }
+
+          const calls = ordered.flatMap((block) =>
+            block.kind === "tool"
+              ? [
+                  {
+                    partID: block.partID,
+                    id: block.callID,
+                    name: block.name,
+                    input: block.input,
+                    ...(block.error === undefined ? {} : { error: block.error }),
+                  },
+                ]
+              : [],
+          )
 
           const settled = {
             id: assistant.id,
@@ -372,12 +500,12 @@ export const layerWith = (resolve: ResolveModel) =>
           const incomplete = turn.finish === undefined ? undefined : INCOMPLETE_FINISH[turn.finish]
           if (incomplete !== undefined) input.sink.incomplete({ reason: turn.finish!, detail: incomplete })
 
-          if (turn.calls.length === 0) {
+          if (calls.length === 0) {
             yield* store.completeMessage(settled)
             return false
           }
 
-          yield* settleCalls({ ...input, assistantID: assistant.id, calls: turn.calls })
+          yield* settleCalls({ ...input, assistantID: assistant.id, calls })
           yield* store.completeMessage(settled)
           // Tool calls were made, so normally the model gets their results back.
           // Not when the provider stopped for a reason that makes continuing
@@ -391,15 +519,14 @@ export const layerWith = (resolve: ResolveModel) =>
         readonly directory: string
         readonly assistantID: MessageID
         readonly sink: Sink
-        readonly calls: readonly { id: string; name: string; input: unknown; error?: string }[]
+        readonly calls: readonly { partID: PartID; id: string; name: string; input: unknown; error?: string }[]
       }) =>
         Effect.forEach(
           input.calls,
           (call) =>
             Effect.gen(function* () {
-              const partId = newPartID()
               const base = {
-                id: partId,
+                id: call.partID,
                 messageID: input.assistantID,
                 sessionID: input.sessionID,
                 type: "tool" as const,

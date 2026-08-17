@@ -25,6 +25,16 @@ export const ReasoningPart = Schema.Struct({
   sessionID: SessionID,
   type: Schema.Literal("reasoning"),
   text: Schema.String,
+  /**
+   * Provider-specific data attached to the block — OpenAI's encrypted reasoning
+   * content and item ids, for instance.
+   *
+   * Kept even though reasoning is not currently replayed to the provider. Parts
+   * are stored as JSON so the field costs no migration, but the data is only
+   * available while the turn is streaming: adding this later would mean every
+   * session recorded before then has lost it permanently.
+   */
+  metadata: Schema.optionalKey(Schema.Record(Schema.String, Schema.Unknown)),
 })
 export type ReasoningPart = typeof ReasoningPart.Type
 

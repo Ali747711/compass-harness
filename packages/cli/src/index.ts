@@ -89,6 +89,9 @@ const program = Effect.gen(function* () {
         const mark = event.state === "error" ? "✗" : "✓"
         process.stderr.write(`  ${mark} ${event.name}${event.title ? ` — ${event.title}` : ""}\n`)
       },
+      // Reasoning goes to stderr, dimmed, so piping stdout still yields only the
+      // answer — but the terminal is not silent while a reasoning model thinks.
+      reasoning: (delta) => process.stderr.write(`\u001b[2m${delta}\u001b[0m`),
       // Also stderr. A retry replays the turn, so whatever the failed attempt
       // already streamed to stdout is about to be said a second time — this
       // line is what makes that legible rather than baffling.
