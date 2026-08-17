@@ -409,6 +409,62 @@ describe("token accounting", () => {
   })
 })
 
+describe("the tool_use / tool_result contract", () => {
+  /**
+   * The invariant with the worst failure mode in the whole harness. A provider
+   * rejects an assistant turn carrying a tool_use with no matching tool_result;
+   * that rejection is not retryable, is not an overflow, and the store has no
+   * delete — so the session is finished. This walks every request actually sent
+   * and checks the pairing holds, rather than checking one part in isolation.
+   */
+  const unpaired = (prompt: unknown): string[] => {
+    const messages = prompt as { role: string; content?: { type?: string; toolCallId?: string }[] }[]
+    const problems: string[] = []
+    for (const [index, message] of messages.entries()) {
+      if (message.role === "tool" && (index === 0 || messages[index - 1]?.role !== "assistant")) {
+        problems.push(`tool message at ${index} does not follow an assistant message`)
+      }
+      if (message.role !== "assistant") continue
+      const calls = (message.content ?? []).filter((p) => p.type === "tool-call").map((p) => p.toolCallId)
+      if (calls.length === 0) continue
+      const next = messages[index + 1]
+      const results = next?.role === "tool" ? (next.content ?? []).map((p) => p.toolCallId) : []
+      for (const call of calls) if (!results.includes(call)) problems.push(`unanswered ${call} at ${index}`)
+      for (const result of results) if (!calls.includes(result)) problems.push(`orphan result ${result}`)
+    }
+    return problems
+  }
+
+  test("holds across a turn mixing valid, malformed and unknown tool calls", async () => {
+    const messy: Chunk[] = [
+      { type: "tool-call", toolCallId: "c1", toolName: "echo", input: JSON.stringify({ value: "a" }) },
+      { type: "tool-call", toolCallId: "c2", toolName: "echo", input: "{bad" } as Chunk,
+      { type: "tool-call", toolCallId: "c3", toolName: "nope", input: "{}" } as Chunk,
+      finishWith("tool-calls"),
+    ]
+    await withHarness([messy, text("done")], async (h) => {
+      await prompt(h, "go")
+      for (const sent of h.script.prompts) expect(unpaired(sent)).toEqual([])
+    })
+  })
+
+  /** Slicing history at a compaction boundary must not orphan a call from its result. */
+  test("holds across a compaction boundary", async () => {
+    const BIG = "detail ".repeat(6_000)
+    const overflowingToolTurn: Chunk[] = [
+      { type: "text-start", id: "t0" },
+      { type: "text-delta", id: "t0", delta: BIG },
+      { type: "text-end", id: "t0" },
+      { type: "tool-call", toolCallId: "c1", toolName: "echo", input: JSON.stringify({ value: "a" }) },
+      { type: "finish", finishReason: reason("tool-calls"), usage: usage({ in: 150_000, out: 500 }) } as Chunk,
+    ]
+    await withHarness([overflowingToolTurn, text("## Objective\n- ok")], async (h) => {
+      await prompt(h, "go")
+      for (const sent of h.script.prompts) expect(unpaired(sent)).toEqual([])
+    })
+  })
+})
+
 describe("reasoning and block order", () => {
   const reasoningTurn: Chunk[] = [
     { type: "reasoning-start", id: "r0", providerMetadata: { openai: { itemId: "rs_1" } } } as Chunk,

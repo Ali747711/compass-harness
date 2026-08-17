@@ -42,6 +42,26 @@ export const MessageTable = sqliteTable(
 )
 
 /**
+ * Prompts that have been durably admitted but not necessarily delivered.
+ * `promoted_seq` null means still pending.
+ */
+export const SessionInputTable = sqliteTable(
+  "session_input",
+  {
+    id: text().primaryKey(),
+    session_id: text().notNull(),
+    prompt: text().notNull(),
+    delivery: text({ enum: ["steer", "queue"] }).notNull(),
+    admitted_seq: integer().notNull(),
+    promoted_seq: integer(),
+    time_created: integer().notNull(),
+  },
+  (table) => [
+    index("session_input_pending_idx").on(table.session_id, table.promoted_seq, table.delivery, table.admitted_seq),
+  ],
+)
+
+/**
  * Part payloads are stored as one JSON column rather than a wide table.
  * Parts are always read by message, never queried by their inner fields, so
  * columns would buy nothing and cost a migration every time a part type changes.

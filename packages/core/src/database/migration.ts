@@ -64,6 +64,32 @@ export const migrations: readonly Migration[] = [
     name: "0002_message_finish",
     statements: [`ALTER TABLE message ADD COLUMN finish TEXT`],
   },
+  {
+    // Durable prompt admission. A prompt is recorded here before any provider
+    // work begins, so a crash between "the user asked" and "the model was
+    // called" loses nothing.
+    //
+    // `promoted_seq NULL` means pending; setting it is what marks the prompt
+    // delivered. Both sequences are per-session and monotonic, which is what
+    // lets "every steer admitted before this turn started" be a range query
+    // rather than a timestamp comparison.
+    name: "0003_session_input",
+    statements: [
+      `CREATE TABLE session_input (
+        id TEXT PRIMARY KEY,
+        session_id TEXT NOT NULL REFERENCES session(id) ON DELETE CASCADE,
+        prompt TEXT NOT NULL,
+        delivery TEXT NOT NULL,
+        admitted_seq INTEGER NOT NULL,
+        promoted_seq INTEGER,
+        time_created INTEGER NOT NULL
+      )`,
+      // Ordered to serve the only hot query: pending inputs of one delivery for
+      // one session, oldest first.
+      `CREATE INDEX session_input_pending_idx
+         ON session_input (session_id, promoted_seq, delivery, admitted_seq)`,
+    ],
+  },
 ]
 
 export function migrate(db: BunDatabase) {
