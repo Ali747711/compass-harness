@@ -109,8 +109,7 @@ const seed = (directory: string, relative: string, contents = "x") => {
  * renders paths inside the session directory relative to it, so these are compared
  * as printed — a random tmpdir name can never spoof a match.
  */
-const listed = (result: Result) =>
-  (result.output.split("\n\n")[0] ?? "").split("\n").toSorted()
+const listed = (result: Result) => (result.output.split("\n\n")[0] ?? "").split("\n").toSorted()
 
 beforeAll(() => {
   root = mkdtempSync(path.join(tmpdir(), "compass-glob-"))

@@ -430,8 +430,7 @@ export const grepTool = make<Params>({
         "",
       ]
       for (const entry of groups) {
-        for (const hit of entry.hits)
-          lines.push(`${displayPath(context.directory, hit.path)}:${hit.line}:${hit.text}`)
+        for (const hit of entry.hits) lines.push(`${displayPath(context.directory, hit.path)}:${hit.line}:${hit.text}`)
       }
       if (outcome.capped) {
         lines.push("")

@@ -9,9 +9,11 @@ import {
 import { jsonSchema, streamText, tool as aiTool, type LanguageModel, type ModelMessage, type ToolSet } from "ai"
 import { Context, Data, Effect, Layer } from "effect"
 import { prune } from "../context/pipeline"
+import { describe as describeProviderError } from "../provider/error"
 import { parseModel, resolveModel, type ModelRef } from "../provider/provider"
 import { ToolRegistry } from "../tool/registry"
 import { parameters } from "../tool/tool"
+import { policy, type Attempt } from "./retry"
 import { SessionStore } from "./store"
 
 /**
@@ -21,6 +23,13 @@ import { SessionStore } from "./store"
 export interface Sink {
   readonly text: (delta: string) => void
   readonly tool: (event: { readonly name: string; readonly state: ToolPart["state"]; readonly title?: string }) => void
+  /**
+   * A transient provider failure is being waited out. Reported rather than
+   * hidden: a silent 30-second backoff is indistinguishable from a hang, and
+   * the retry replays the turn, so any text already streamed will appear twice
+   * unless something marks the boundary.
+   */
+  readonly retry: (attempt: Attempt) => void
 }
 
 export interface RunInput {
@@ -46,18 +55,6 @@ export class ProviderFailure extends Data.TaggedError("ProviderFailure")<{
 
 export interface Interface {
   readonly prompt: (input: RunInput) => Effect.Effect<void, ProviderFailure>
-}
-
-/** Pulls the useful line out of an AI SDK error without dragging the request body along. */
-function describeProviderError(cause: unknown): { message: string; status?: number } {
-  const error = cause as { message?: unknown; statusCode?: unknown; name?: unknown }
-  const status = typeof error?.statusCode === "number" ? error.statusCode : undefined
-  const detail = typeof error?.message === "string" ? error.message.split("\n")[0]! : String(cause)
-  if (status === 401 || status === 403) {
-    return { message: `${detail} Check ANTHROPIC_API_KEY (or OPENAI_API_KEY for an openai/ model).`, status }
-  }
-  if (status === 429) return { message: `${detail} The provider is rate limiting; retry shortly.`, status }
-  return status === undefined ? { message: detail } : { message: detail, status }
 }
 
 export class SessionRun extends Context.Service<SessionRun, Interface>()("compass/SessionRun") {}
@@ -181,6 +178,15 @@ export const layerWith = (resolve: ResolveModel) =>
                 // outside a protected recent window. A no-op under the threshold.
                 messages: prune(toModelMessages(history)).messages,
                 tools: toolSet,
+                // The SDK retries twice by default, underneath us and invisibly.
+                // That second policy is worse than ours in every respect: it
+                // re-sends prompts the provider rejected as too long, ignores
+                // Retry-After, reports nothing to the user, and multiplies our
+                // own attempts rather than composing with them — six real calls
+                // where the schedule intended two. opencode sets this to 0 for
+                // the same reason (session/llm.ts:323); retry policy belongs in
+                // one place, and this is not it.
+                maxRetries: 0,
                 // The SDK's default onError is `console.error(error)`, which dumps
                 // the whole cause — request body and system prompt included — to
                 // the terminal. The error is surfaced from fullStream below, so
@@ -206,6 +212,16 @@ export const layerWith = (resolve: ResolveModel) =>
             },
             catch: (cause) => (cause instanceof Error ? cause : new Error(String(cause))),
           }).pipe(
+            // Retry first, and only then record the failure. A 503 on the first
+            // attempt that succeeds on the second is not an error the session
+            // should remember — marking the message failed before the schedule
+            // has given up would persist a defeat that never happened.
+            //
+            // The whole stream consumption is inside the retried effect, so an
+            // attempt starts from a clean `text`/`calls` pair rather than
+            // resuming a half-read stream. Nothing has been persisted at this
+            // point either, so a replay cannot double-write parts.
+            Effect.retry(policy((attempt) => Effect.sync(() => input.sink.retry(attempt)))),
             Effect.tapError((error) => store.completeMessage({ id: assistant.id, error: error.message })),
             Effect.mapError((error) => new ProviderFailure(describeProviderError(error))),
           )

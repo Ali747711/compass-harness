@@ -1,6 +1,7 @@
 #!/usr/bin/env bun
 import { SessionID } from "@compass/schema"
 import { layerDefault } from "@compass/core/database/database"
+import { RETRY_MAX_RETRIES } from "@compass/core/session/retry"
 import { SessionRun } from "@compass/core/session/run"
 import { SessionStore, layer as storeLayer } from "@compass/core/session/store"
 import { at, layer as locationsLayer } from "@compass/core/location/service-map"
@@ -84,6 +85,15 @@ const program = Effect.gen(function* () {
         if (event.state === "running") return process.stderr.write(`\n  ⋯ ${event.name}\n`)
         const mark = event.state === "error" ? "✗" : "✓"
         process.stderr.write(`  ${mark} ${event.name}${event.title ? ` — ${event.title}` : ""}\n`)
+      },
+      // Also stderr. A retry replays the turn, so whatever the failed attempt
+      // already streamed to stdout is about to be said a second time — this
+      // line is what makes that legible rather than baffling.
+      retry: (attempt) => {
+        const seconds = Math.max(1, Math.round((attempt.next - Date.now()) / 1000))
+        process.stderr.write(
+          `\n  ⟳ ${attempt.message} — retrying in ${seconds}s (${attempt.attempt}/${RETRY_MAX_RETRIES})\n`,
+        )
       },
     },
   })
