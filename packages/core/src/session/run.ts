@@ -33,6 +33,7 @@ import {
   summaryFits,
 } from "./compaction"
 import { SessionInput } from "./input"
+import { deriveSubagentRuleset, type Ruleset } from "../permission/ruleset"
 import { isOverflow } from "./overflow"
 import { policy, type Attempt } from "./retry"
 import { SessionStore } from "./store"
@@ -197,6 +198,8 @@ interface Turn {
   readonly sink: Sink
   readonly abort: AbortSignal
   readonly instructions: string
+  /** Empty for a top-level session; a child carries what derivation gave it. */
+  readonly ruleset: Ruleset
 }
 
 interface HistoryEntry {
@@ -625,6 +628,7 @@ export const layerWith = (resolve: ResolveModel) =>
                   callID: call.id,
                   directory: input.directory,
                   abort: input.abort,
+                  ruleset: input.ruleset,
                   // Closes over this turn, so a child inherits its directory,
                   // model and abort signal without any of it being global.
                   spawn: spawn(input),
@@ -975,6 +979,9 @@ export const layerWith = (resolve: ResolveModel) =>
                 // The agent's own prompt replaces the primary one; the project's
                 // instructions still apply, since the child works in the same repo.
                 instructions: [definition.prompt, parent.instructions].filter(Boolean).join("\n\n"),
+                // What the child may actually do. The parent's denials are folded
+                // in here, so a permissive agent definition cannot widen them.
+                ruleset: deriveSubagentRuleset({ parent: parent.ruleset, subagent: definition.permission }),
               }),
             )
 
@@ -1031,6 +1038,9 @@ export const layerWith = (resolve: ResolveModel) =>
               sink: input.sink,
               abort: controller.signal,
               instructions: render(files),
+              // A top-level session is governed by the configured Permission
+              // layer alone; it adds nothing of its own.
+              ruleset: [],
             })
           }).pipe(
             // Effect can end its own promises on interruption, but a tool already

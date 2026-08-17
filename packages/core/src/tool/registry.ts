@@ -1,14 +1,18 @@
 import { Context as EffectContext, Effect, Layer, Result as EffectResult } from "effect"
 import { Permission, type Interface as PermissionService } from "../permission/permission"
+import type { Ruleset } from "../permission/ruleset"
 import { Spill } from "./spill"
 import { bound, exceeds } from "./truncate"
-import { decode, validName, type Context, type Result, type Tool } from "./tool"
+import { ToolFailure, decode, validName, type Context, type Result, type Tool } from "./tool"
 
 /**
  * What a caller supplies. `ask` is injected by the registry from the Permission
  * service, so the runner never touches policy and no tool can bypass it.
  */
-export type CallContext = Omit<Context, "ask">
+export type CallContext = Omit<Context, "ask"> & {
+  /** Rules for this session only, forwarded to Permission with every request. */
+  readonly ruleset?: Ruleset
+}
 
 export interface Registration {
   readonly name: string
@@ -49,8 +53,22 @@ export function make(registrations: readonly Registration[], permission: Permiss
         const tool = byName.get(input.name)
         if (!tool) return { ok: false as const, error: `Unknown tool: ${input.name}` }
 
-        const context: Context = { ...input.context, ask: permission.ask }
-        const settled = yield* decode(tool, input.input).pipe(
+        // The session's ruleset rides along on every ask, so a tool cannot omit
+        // it and a subagent's derived denials apply to everything it tries.
+        const { ruleset, ...rest } = input.context
+        const context: Context = {
+          ...rest,
+          ask: (request) => permission.ask(ruleset === undefined ? request : { ...request, ruleset }),
+        }
+        // Gate on the tool's own name before it runs. Previously every tool had
+        // to remember to ask, and none of them did except through path-guard's
+        // external_directory check — so a rule like `deny: write` was
+        // unreachable and a read-only agent was read-only by convention. Doing
+        // it here means a tool cannot opt out, the same reason bounding lives
+        // here rather than in each tool.
+        const settled = yield* context.ask({ permission: input.name, patterns: ["*"], always: ["*"] }).pipe(
+          Effect.mapError((denied) => new ToolFailure({ message: denied.message })),
+          Effect.flatMap(() => decode(tool, input.input)),
           Effect.flatMap((decoded) => tool.execute(decoded, context)),
           Effect.result,
         )

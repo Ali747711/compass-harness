@@ -18,6 +18,15 @@ export interface Request {
   /** Patterns to remember if the user answers "always". */
   readonly always?: readonly string[]
   readonly metadata?: Readonly<Record<string, unknown>>
+  /**
+   * Rules that apply to this call only — a subagent's derived ruleset.
+   *
+   * Carried on the request rather than baked into the service because the
+   * service is shared across every session in a Location, while a child
+   * session's capabilities are its own. Evaluated after the configured rules,
+   * so a session's own ruleset is the more specific answer.
+   */
+  readonly ruleset?: Ruleset
 }
 
 export interface Interface {
@@ -33,12 +42,6 @@ export class Permission extends Context.Service<Permission, Interface>()("compas
  * every request is granted, and the seam exists so tools can be written against
  * the real contract now rather than retrofitted later.
  */
-export const layerAllowAll = Layer.sync(Permission, () =>
-  Permission.of({
-    ask: () => Effect.void,
-  }),
-)
-
 /** Denies everything. For tests that assert a tool honors refusal. */
 export const layerDenyAll = Layer.sync(Permission, () =>
   Permission.of({
@@ -80,7 +83,7 @@ export const layerRuleset = (input: {
         Effect.gen(function* () {
           const patterns = request.patterns.length > 0 ? request.patterns : ["*"]
           for (const pattern of patterns) {
-            const rule = evaluate(request.permission, pattern, input.ruleset)
+            const rule = evaluate(request.permission, pattern, input.ruleset, request.ruleset ?? [])
             if (rule.action === "allow") continue
             if (rule.action === "deny") return yield* new PermissionDenied({ permission: request.permission, pattern })
             const granted = input.onAsk === undefined ? true : yield* input.onAsk(request, rule)
@@ -89,5 +92,15 @@ export const layerRuleset = (input: {
         }),
     }),
   )
+
+/**
+ * Grants anything the request itself does not forbid.
+ *
+ * Still honours a per-request ruleset, which is the point: a subagent's derived
+ * denials have to bite even when nothing global is configured, or the whole
+ * derivation is decorative. Without this, `explore` would be read-only in
+ * theory and able to write in practice.
+ */
+export const layerAllowAll = layerRuleset({ ruleset: [] })
 
 export * as PermissionModule from "./permission"

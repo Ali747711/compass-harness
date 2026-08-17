@@ -2,7 +2,7 @@ import { APICallError } from "ai"
 import { MockLanguageModelV4, simulateReadableStream } from "ai/test"
 import { describe, expect, test } from "bun:test"
 import { Effect, Fiber, Layer, Schema } from "effect"
-import { mkdtempSync, rmSync, writeFileSync } from "node:fs"
+import { existsSync, mkdtempSync, rmSync, writeFileSync } from "node:fs"
 import { tmpdir } from "node:os"
 import { join } from "node:path"
 import { layerMemory } from "../src/database/database"
@@ -14,6 +14,7 @@ import { SessionRun, layerWith, toModelMessages } from "../src/session/run"
 import { SessionStore, layer as storeLayer } from "../src/session/store"
 import { layer as registryLayer } from "../src/tool/registry"
 import { task } from "../src/tool/task"
+import { writeTool } from "../src/tool/write"
 import { make as makeTool } from "../src/tool/tool"
 
 /**
@@ -119,7 +120,11 @@ const explode = makeTool({
   execute: () => Effect.die(new Error("tool blew up")),
 })
 
-function harness(turns: readonly Chunk[][], override?: MockLanguageModelV4) {
+function harness(
+  turns: readonly Chunk[][],
+  override?: MockLanguageModelV4,
+  extra: readonly { name: string; tool: Parameters<typeof registryLayer>[0][number]["tool"] }[] = [],
+) {
   const script = scripted(turns)
   const model = override ?? script.model
   const directory = mkdtempSync(join(tmpdir(), "run-"))
@@ -160,6 +165,7 @@ function harness(turns: readonly Chunk[][], override?: MockLanguageModelV4) {
         { name: "explode", tool: explode },
         // Delegation is exercised through the real tool, not a stand-in.
         { name: "task", tool: task },
+        ...extra,
       ]),
     ),
     Layer.provideMerge(inputLayer),
@@ -536,9 +542,44 @@ describe("subagents", () => {
       .filter((part) => part.type === "tool" && (part as { state: string }).state === "error")
       .map((part) => (part as { error?: string }).error)
 
-    expect(errors.some((message) => message?.includes("nests"))).toBe(true)
+    // Two independent locks, and the derived ruleset is the one that fires
+    // first: `task` is force-denied in a child, so the call is refused before
+    // the depth walk is even reached. Either message means the child was
+    // stopped; asserting on both is what proves neither has quietly gone away.
+    expect(errors.length).toBeGreaterThan(0)
+    expect(errors.some((message) => /Permission denied: task|nests/.test(message ?? ""))).toBe(true)
     // And the parent still got a usable answer rather than a hang.
     expect(JSON.stringify(history)).toContain("child gave up")
+    h.cleanup()
+  })
+
+  /**
+   * The test that decides whether the derivation is real or decorative. The
+   * `explore` agent denies `write`; if that denial is not enforced at runtime,
+   * a read-only agent is read-only only by convention.
+   */
+  test("an explore child genuinely cannot write, not merely told not to", async () => {
+    const scratch = mkdtempSync(join(tmpdir(), "explore-"))
+    const target = join(scratch, "should-not-exist.txt")
+    const writeAttempt: Chunk[] = [
+      {
+        type: "tool-call",
+        toolCallId: "call_w",
+        toolName: "write",
+        input: JSON.stringify({ filePath: target, content: "escaped" }),
+      },
+      finishWith("tool-calls"),
+    ]
+    // 1: parent delegates to explore. 2: the child tries to write. 3: it gives
+    // up. 4: the parent replies.
+    const h = harness([delegate("explore"), writeAttempt, text("could not write"), text("done")], undefined, [
+      { name: "write", tool: writeTool },
+    ])
+
+    await prompt(h, "go")
+
+    expect(existsSync(target)).toBe(false)
+    rmSync(scratch, { recursive: true, force: true })
     h.cleanup()
   })
 

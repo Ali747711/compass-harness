@@ -11,7 +11,14 @@ import { Effect, Layer, Schema } from "effect"
 import { existsSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs"
 import { tmpdir } from "node:os"
 import * as path from "node:path"
-import { Permission, layerAllowAll, layerDenyAll, layerRecording, type Request } from "../src/permission/permission"
+import {
+  Permission,
+  layerAllowAll,
+  layerDenyAll,
+  layerRecording,
+  layerRuleset,
+  type Request,
+} from "../src/permission/permission"
 import { builtins } from "../src/tool/builtins"
 import {
   make as makeRegistry,
@@ -207,7 +214,10 @@ describe("settle: permission injection", () => {
 
     const error = expectFailed(await settle(registry, "write", { filePath: target, content: "should not land" }))
 
-    expect(error).toContain("outside the session directory")
+    // Denied at the registry's gate now, before the tool runs at all — so the
+    // message names the refused permission rather than the containment check.
+    // What matters is unchanged: nothing reached the filesystem.
+    expect(error).toContain("Permission denied")
     expect(existsSync(target)).toBe(false)
   })
 
@@ -230,9 +240,36 @@ describe("settle: permission injection", () => {
 
     expectOk(await settle(registry, "write", { filePath: target, content: "recorded" }))
 
-    expect(log.length).toBe(1)
-    expect(log.at(0)?.permission).toBe("external_directory")
-    expect(log.at(0)?.patterns).toEqual([path.join(outside, "*")])
+    // Two requests now: the registry gates on the tool's own name first, then
+    // path-guard asks about the directory. Counting only the second keeps this
+    // test about containment rather than about the gate.
+    const external = log.filter((request) => request.permission === "external_directory")
+    expect(external.length).toBe(1)
+    expect(external.at(0)?.patterns).toEqual([path.join(outside, "*")])
+    expect(log.some((request) => request.permission === "write")).toBe(true)
+  })
+
+  /**
+   * The gate now refuses before path-guard runs, so a deny-everything layer no
+   * longer reaches the containment check. This allows the tool by name and
+   * denies only the directory, which is the only way left to prove containment
+   * still refuses on its own.
+   */
+  test("containment still refuses an out-of-tree path when the tool itself is allowed", async () => {
+    const target = path.join(outside, "escaped.txt")
+    const registry = registryFor(
+      layerRuleset({
+        ruleset: [
+          { permission: "write", pattern: "*", action: "allow" },
+          { permission: "external_directory", pattern: "*", action: "deny" },
+        ],
+      }),
+    )
+
+    const error = expectFailed(await settle(registry, "write", { filePath: target, content: "should not land" }))
+
+    expect(error).toContain("outside the session directory")
+    expect(existsSync(target)).toBe(false)
   })
 
   test("asks nothing for an in-tree path", async () => {
@@ -242,7 +279,9 @@ describe("settle: permission injection", () => {
 
     expectOk(await settle(registry, "write", { filePath: target, content: "inside" }))
 
-    expect(log.length).toBe(0)
+    // The tool-name gate still fires; what must not is a directory question
+    // about a path that is plainly inside the project.
+    expect(log.filter((request) => request.permission === "external_directory")).toEqual([])
     expect(readFileSync(target, "utf-8")).toBe("inside")
   })
 
@@ -253,7 +292,7 @@ describe("settle: permission injection", () => {
 
     const error = expectFailed(await settle(registry, "read", { filePath: target }))
 
-    expect(error).toContain("outside the session directory")
+    expect(error).toContain("Permission denied")
     expect(error).not.toContain("top secret")
   })
 })
