@@ -1,7 +1,7 @@
 import { stat } from "node:fs/promises"
 import path from "node:path"
 import { Effect, Schema } from "effect"
-import { resolveWithin } from "./path-guard"
+import { displayPath, resolveWithin } from "./path-guard"
 import { make, render as renderDescription, ToolFailure, type Context } from "./tool"
 import DESCRIPTION from "./glob.txt"
 
@@ -248,7 +248,7 @@ export const globTool = make<Params>({
 
       return {
         title,
-        output: [shown.map((entry) => entry.file).join("\n"), ...notes].join("\n\n"),
+        output: [shown.map((entry) => displayPath(context.directory, entry.file)).join("\n"), ...notes].join("\n\n"),
         metadata,
       }
     }),

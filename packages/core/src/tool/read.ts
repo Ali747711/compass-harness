@@ -7,8 +7,8 @@
 
 import { Effect, Result, Schema } from "effect"
 import { readdir, stat } from "node:fs/promises"
-import { basename, dirname, extname, isAbsolute, join, relative } from "node:path"
-import { resolveWithin } from "./path-guard"
+import { basename, dirname, extname, join } from "node:path"
+import { displayPath, resolveWithin } from "./path-guard"
 import { ToolFailure, make, render as renderDescription, type Context } from "./tool"
 import DESCRIPTION from "./read.txt"
 
@@ -106,11 +106,6 @@ const checkpoint = (context: Context, filePath: string) =>
   Effect.suspend(() => (context.abort.aborted ? Effect.fail(cancelled(filePath)) : Effect.void))
 
 /** Short label for the TUI: relative to the session directory when the file lives under it. */
-const label = (filePath: string, directory: string) => {
-  const rel = relative(directory, filePath)
-  return rel === "" || rel.startsWith("..") || isAbsolute(rel) ? filePath : rel
-}
-
 const looksBinary = (bytes: Uint8Array) => {
   if (bytes.length === 0) return false
   let nonPrintable = 0
@@ -261,8 +256,8 @@ const paginate = (filePath: string, offset: number, limit: number, abort: AbortS
         : new ToolFailure({ message: `Could not read ${filePath}: ${reason(cause)}` }),
   })
 
-const render = (filePath: string, body: string, footer: string) =>
-  [`<path>${filePath}</path>`, "<content>", body, "</content>", "", footer].join("\n")
+const render = (shownPath: string, body: string, footer: string) =>
+  [`<path>${shownPath}</path>`, "<content>", body, "</content>", "", footer].join("\n")
 
 export const readTool = make<Input>({
   description: renderDescription(DESCRIPTION, { DEFAULT_LIMIT, MAX_LINE_WIDTH }),
@@ -270,7 +265,7 @@ export const readTool = make<Input>({
   execute: (input, context) =>
     Effect.gen(function* () {
       const filePath = yield* resolveWithin(context, input.filePath)
-      const title = label(filePath, context.directory)
+      const title = displayPath(context.directory, filePath)
       yield* checkpoint(context, filePath)
 
       const stats = yield* Effect.tryPromise({ try: () => stat(filePath), catch: errnoCode }).pipe(Effect.result)
@@ -310,7 +305,7 @@ export const readTool = make<Input>({
       if (info.size === 0) {
         return {
           title,
-          output: render(filePath, "", "(File is empty - 0 lines)"),
+          output: render(title, "", "(File is empty - 0 lines)"),
           metadata: { path: filePath, totalLines: 0, empty: true },
         }
       }
@@ -346,7 +341,7 @@ export const readTool = make<Input>({
 
       return {
         title,
-        output: render(filePath, body, footer),
+        output: render(title, body, footer),
         // Deliberately no delivered line range. The registry bounds `output` after
         // this returns, so any exact range stated here could contradict what the
         // model actually received; the footer inside `output` is the one claim

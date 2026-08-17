@@ -85,7 +85,8 @@ describe("readTool", () => {
 
     expect(result.output).toBe(
       [
-        "<path>" + path + "</path>",
+        // Inside the session directory, so the header is spelled relative to it.
+        "<path>basic.txt</path>",
         "<content>",
         "1: alpha",
         "2: beta",

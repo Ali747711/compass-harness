@@ -87,7 +87,8 @@ describe("settle: output bounding of real tools", () => {
     expect(result.output).toContain("Use offset=50000 to continue.")
     expect(result.output).toContain("(Showing lines 1-50000 of 60000.")
     // Head framing survives too, so the model still knows which file it is reading.
-    expect(result.output.startsWith(`<path>${file}</path>`)).toBe(true)
+    // The path is shown relative to the session directory (see `displayPath`).
+    expect(result.output.startsWith("<path>huge.txt</path>")).toBe(true)
     expect(result.output).toContain("1: line 0")
     // And the drop is announced rather than silent.
     expect(result.output).toMatch(/truncated/)
@@ -137,7 +138,7 @@ describe("settle: output bounding of real tools", () => {
     const result = expectOk(await settle(registry, "read", { filePath: file }))
 
     expect(result.output).toBe(
-      [`<path>${file}</path>`, "<content>", "1: alpha", "2: beta", "</content>", "", "(End of file - 2 lines)"].join(
+      ["<path>small.txt</path>", "<content>", "1: alpha", "2: beta", "</content>", "", "(End of file - 2 lines)"].join(
         "\n",
       ),
     )

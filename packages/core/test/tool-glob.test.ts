@@ -104,12 +104,13 @@ const seed = (directory: string, relative: string, contents = "x") => {
   return file
 }
 
-/** Paths from the listing block only, relative to `directory`, so trailing notes stay out. */
-const listed = (result: Result, directory: string) =>
-  (result.output.split("\n\n")[0] ?? "")
-    .split("\n")
-    .map((line) => path.relative(directory, line))
-    .toSorted()
+/**
+ * Paths from the listing block only, so trailing notes stay out. The tool already
+ * renders paths inside the session directory relative to it, so these are compared
+ * as printed — a random tmpdir name can never spoof a match.
+ */
+const listed = (result: Result) =>
+  (result.output.split("\n\n")[0] ?? "").split("\n").toSorted()
 
 beforeAll(() => {
   root = mkdtempSync(path.join(tmpdir(), "compass-glob-"))
@@ -128,14 +129,15 @@ afterAll(() => {
 })
 
 describe("globTool", () => {
-  test("finds matching files and returns absolute paths", async () => {
+  test("finds matching files and returns paths relative to the session directory", async () => {
     const result = await run({ pattern: "**/*.ts" })
     const lines = result.output.split("\n")
 
-    expect(lines).toContain(path.join(root, "src/old.ts"))
-    expect(lines).toContain(path.join(root, "src/newest.ts"))
-    expect(lines).toContain(path.join(root, "src/nested/middle.ts"))
-    expect(lines.every((line) => path.isAbsolute(line))).toBe(true)
+    expect(lines).toContain(path.join("src", "old.ts"))
+    expect(lines).toContain(path.join("src", "newest.ts"))
+    expect(lines).toContain(path.join("src", "nested", "middle.ts"))
+    // Every match here lives inside the session directory, so none of them stay absolute.
+    expect(lines.every((line) => !path.isAbsolute(line))).toBe(true)
     expect(result.output).not.toContain("notes.md")
   })
 
@@ -143,16 +145,16 @@ describe("globTool", () => {
     const result = await run({ pattern: "src/**/*.ts" })
 
     expect(result.output.split("\n")).toEqual([
-      path.join(root, "src/newest.ts"),
-      path.join(root, "src/nested/middle.ts"),
-      path.join(root, "src/old.ts"),
+      path.join("src", "newest.ts"),
+      path.join("src", "nested", "middle.ts"),
+      path.join("src", "old.ts"),
     ])
   })
 
   test("ignores node_modules, dist and .git by default", async () => {
     const result = await run({ pattern: "**/*.ts" })
-    // Compared relative to root so a random tmpdir name can never spoof a match.
-    const relative = result.output.split("\n").map((line) => path.relative(root, line))
+    // Already printed relative to root, so a random tmpdir name can never spoof a match.
+    const relative = result.output.split("\n")
 
     expect(relative.toSorted()).toEqual([
       path.join("src", "nested", "middle.ts"),
@@ -165,7 +167,7 @@ describe("globTool", () => {
   test("searches an ignored directory when the pattern names it explicitly", async () => {
     const result = await run({ pattern: "node_modules/**/*.ts" })
 
-    expect(result.output).toBe(path.join(root, "node_modules/dep/index.ts"))
+    expect(result.output).toBe(path.join("node_modules", "dep", "index.ts"))
     expect(result.metadata?.matched).toBe(1)
   })
 
@@ -176,7 +178,7 @@ describe("globTool", () => {
 
     const result = await run({ pattern: "**/dist-utils/*.ts" }, directory)
 
-    expect(listed(result, directory)).toEqual([path.join("src", "dist-utils", "visible.ts")])
+    expect(listed(result)).toEqual([path.join("src", "dist-utils", "visible.ts")])
     expect(result.metadata?.matched).toBe(1)
   })
 
@@ -187,15 +189,15 @@ describe("globTool", () => {
 
     const result = await run({ pattern: "**/.gitkeep" }, directory)
 
-    expect(listed(result, directory)).toEqual([path.join("src", ".gitkeep")])
+    expect(listed(result)).toEqual([path.join("src", ".gitkeep")])
   })
 
   test("caps output at the limit and reports that results were capped", async () => {
     const result = await run({ pattern: "src/**/*.ts", limit: 2 })
     const lines = result.output.split("\n")
 
-    expect(lines[0]).toBe(path.join(root, "src/newest.ts"))
-    expect(lines[1]).toBe(path.join(root, "src/nested/middle.ts"))
+    expect(lines[0]).toBe(path.join("src", "newest.ts"))
+    expect(lines[1]).toBe(path.join("src", "nested", "middle.ts"))
     expect(result.output).toContain("Showing the 2 most recently modified of 3 matches")
     expect(result.metadata?.count).toBe(2)
     expect(result.metadata?.matched).toBe(3)
@@ -213,7 +215,7 @@ describe("globTool", () => {
   test("resolves a relative path against the session directory", async () => {
     const result = await run({ pattern: "*.ts", path: "src/nested" })
 
-    expect(result.output).toBe(path.join(root, "src/nested/middle.ts"))
+    expect(result.output).toBe(path.join("src", "nested", "middle.ts"))
     expect(result.title).toBe(`*.ts in ${path.join("src", "nested")}`)
   })
 
@@ -384,7 +386,7 @@ describe("globTool", () => {
 
     expect(result.metadata?.vanished).toBe(1)
     expect(result.metadata?.matched).toBe(2)
-    expect(listed(result, directory)).toEqual(["a.ts", "c.ts"])
+    expect(listed(result)).toEqual(["a.ts", "c.ts"])
     expect(result.output).toContain("1 matched path disappeared")
   })
 

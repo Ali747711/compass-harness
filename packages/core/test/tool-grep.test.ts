@@ -3,7 +3,7 @@ import { afterAll, afterEach, beforeEach, describe, expect, test } from "bun:tes
 import { Effect, Result } from "effect"
 import { chmodSync, mkdirSync, mkdtempSync, rmSync, utimesSync, writeFileSync } from "node:fs"
 import { tmpdir } from "node:os"
-import { join } from "node:path"
+import { join, relative } from "node:path"
 import { PermissionDenied, type Request as PermissionRequest } from "../src/permission/permission"
 import { grepTool } from "../src/tool/grep"
 import { decode, type Context, type Result as ToolResult, type ToolFailure } from "../src/tool/tool"
@@ -113,11 +113,11 @@ for (const engine of engines) {
       expect(result.title).toBe("TODO")
     })
 
-    test("emits absolute path:line:text lines", async () => {
+    test("emits path:line:text lines relative to the session directory", async () => {
       const root = fixture()
       const result = await succeed({ pattern: "TODO: alpha" }, root)
 
-      expect(result.output).toContain(`${join(root, "alpha.ts")}:2:// TODO: alpha`)
+      expect(result.output).toContain("alpha.ts:2:// TODO: alpha")
       expect(result.output).toStartWith("Found 1 match in 1 file")
     })
 
@@ -131,8 +131,8 @@ for (const engine of engines) {
       const result = await succeed({ pattern: "TODO", include: "*.ts" }, root)
 
       expect(result.metadata?.["matches"]).toBe(2)
-      expect(result.output).toContain(join(root, "alpha.ts"))
-      expect(result.output).toContain(join(root, "sub", "beta.ts"))
+      expect(result.output).toContain("alpha.ts:2:")
+      expect(result.output).toContain(`${join("sub", "beta.ts")}:2:`)
       expect(result.output).not.toContain("gamma.txt")
     })
 
@@ -160,7 +160,7 @@ for (const engine of engines) {
       const result = await succeed({ pattern: "TODO", path: join(root, "sub", "gamma.txt") }, root)
 
       expect(result.metadata?.["matches"]).toBe(1)
-      expect(result.output).toContain(`${join(root, "sub", "gamma.txt")}:2:TODO: gamma`)
+      expect(result.output).toContain(`${join("sub", "gamma.txt")}:2:TODO: gamma`)
     })
 
     test("treats regex metacharacters as regex, not literals", async () => {
@@ -168,7 +168,7 @@ for (const engine of engines) {
       const result = await succeed({ pattern: "function\\s+\\w+", include: "*.ts" }, root)
 
       expect(result.metadata?.["matches"]).toBe(1)
-      expect(result.output).toContain(join(root, "sub", "beta.ts"))
+      expect(result.output).toContain(`${join("sub", "beta.ts")}:1:`)
     })
 
     test("reports no matches as a result, not a failure", async () => {
@@ -208,11 +208,7 @@ for (const engine of engines) {
       utimesSync(join(root, "sub", "gamma.txt"), older, older)
 
       const result = await succeed({ pattern: "TODO" }, root)
-      expect(matchedFiles(result)).toEqual([
-        join(root, "alpha.ts"),
-        join(root, "sub", "gamma.txt"),
-        join(root, "sub", "beta.ts"),
-      ])
+      expect(matchedFiles(result)).toEqual(["alpha.ts", join("sub", "gamma.txt"), join("sub", "beta.ts")])
     })
 
     test("keeps every match of a file together and in line order", async () => {
@@ -220,10 +216,7 @@ for (const engine of engines) {
       writeFileSync(join(root, "alpha.ts"), "TODO one\nfiller\nTODO two\n")
       const result = await succeed({ pattern: "TODO", include: "alpha.ts" }, root)
 
-      expect(result.output.split("\n").slice(2)).toEqual([
-        `${join(root, "alpha.ts")}:1:TODO one`,
-        `${join(root, "alpha.ts")}:3:TODO two`,
-      ])
+      expect(result.output.split("\n").slice(2)).toEqual(["alpha.ts:1:TODO one", "alpha.ts:3:TODO two"])
     })
 
     test("marks a long matched line with what it cut", async () => {
@@ -245,7 +238,7 @@ for (const engine of engines) {
       expect(result.metadata?.["matches"]).toBe(1)
       expect(result.output).not.toContain("No matches found")
       expect(result.output).toContain(
-        `${join(root, "minified.js")}:1:(match omitted: line too long to display; use read to inspect this file)`,
+        "minified.js:1:(match omitted: line too long to display; use read to inspect this file)",
       )
     })
 
@@ -280,7 +273,7 @@ for (const engine of engines) {
     // named node_modules explicitly could never match anything.
     test("searches a skipped directory when the include glob names it", async () => {
       const root = fixture()
-      const dependency = withDependency(root)
+      const dependency = relative(root, withDependency(root))
       const result = await succeed({ pattern: "TODO", include: "node_modules/**/*.js" }, root)
 
       expect(result.metadata?.["matches"]).toBe(1)
