@@ -117,12 +117,14 @@ function harness(turns: readonly Chunk[][], override?: MockLanguageModelV4) {
     text: string[]
     tools: { name: string; state: string }[]
     retries: { attempt: number; message: string }[]
-  } = { text: [], tools: [], retries: [] }
+    compactions: { state: string; reason?: string }[]
+  } = { text: [], tools: [], retries: [], compactions: [] }
   const sink = {
     text: (delta: string) => captured.text.push(delta),
     tool: (event: { name: string; state: string }) => captured.tools.push({ name: event.name, state: event.state }),
     retry: (attempt: { attempt: number; message: string }) =>
       captured.retries.push({ attempt: attempt.attempt, message: attempt.message }),
+    compaction: (event: { state: string; reason?: string }) => captured.compactions.push(event),
   }
   const layers = layerWith(() => model as never).pipe(
     Layer.provideMerge(
@@ -355,6 +357,144 @@ describe("token accounting", () => {
     const history = await prompt(h, "hi")
 
     expect(history[1]!.info.tokens).toBeUndefined()
+    h.cleanup()
+  })
+})
+
+describe("compaction", () => {
+  /**
+   * A turn that is both *reported* as over budget and *actually* long enough to
+   * have something worth summarizing.
+   *
+   * Both halves matter. Reported usage is what trips the overflow check, but
+   * `select` works on the stored transcript — so a turn claiming 150k tokens
+   * while storing three words correctly compacts to nothing and declines.
+   */
+  const BIG = "detail ".repeat(6_000)
+  const overflowing: Chunk[] = [
+    { type: "text-start", id: "t0" },
+    { type: "text-delta", id: "t0", delta: BIG },
+    { type: "text-end", id: "t0" },
+    { type: "finish", finishReason: "stop", usage: usage({ in: 150_000, out: 500 }) } as Chunk,
+  ]
+
+  test("summarizes once reported usage crosses the model's usable budget", async () => {
+    // Turn 1 overflows; turn 2 is the summarizer; both replay from `scripted`.
+    const h = harness([overflowing, text("## Objective\n- keep going")])
+    await prompt(h, "hi")
+
+    expect(h.captured.compactions.map((c) => c.state)).toEqual(["started", "completed"])
+    h.cleanup()
+  })
+
+  test("leaves a conversation that fits entirely alone", async () => {
+    const h = harness([text("small reply")])
+    await prompt(h, "hi")
+    expect(h.captured.compactions).toEqual([])
+    h.cleanup()
+  })
+
+  /**
+   * The point of the whole exercise: after compaction the provider must stop
+   * being sent the original history.
+   */
+  test("replaces the earlier history in the next request", async () => {
+    const h = harness([overflowing, text("## Objective\n- distinctive-summary-marker")])
+    await h.run(
+      Effect.gen(function* () {
+        const store = yield* SessionStore
+        const session = yield* store.create({ title: "t", directory: h.directory })
+        const runner = yield* SessionRun
+        yield* runner.prompt({ sessionID: session.id, text: "remember-this-original-turn", sink: h.sink })
+        yield* runner.prompt({ sessionID: session.id, text: "second", sink: h.sink })
+      }),
+    )
+
+    const latest = JSON.stringify(h.script.prompts.at(-1))
+    expect(latest).toContain("distinctive-summary-marker")
+    expect(latest).toContain("This conversation was compacted")
+    expect(latest).not.toContain("remember-this-original-turn")
+    h.cleanup()
+  })
+
+  test("keeps the full history on disk — compaction changes the request, not the record", async () => {
+    const h = harness([overflowing, text("## Objective\n- summarized")])
+    const history = await prompt(h, "remember-this-original-turn")
+
+    const stored = JSON.stringify(history)
+    expect(stored).toContain("remember-this-original-turn")
+    expect(history.some((entry) => entry.parts.some((part) => part.type === "compaction"))).toBe(true)
+    h.cleanup()
+  })
+
+  /**
+   * The reactive path. `retryable` refuses to retry an overflow because a plain
+   * retry re-sends the same oversized input; this retries a smaller one, which
+   * is a different thing.
+   */
+  test("compacts and retries when the provider rejects the request as too long", async () => {
+    let call = 0
+    const doStream = (async () => {
+      call++
+      // 1: a long first turn, so there is history to summarize.
+      // 2: the second turn, rejected as too long.
+      // 3: the summarizer.  4: the retry, against a compacted history.
+      if (call === 1)
+        return { stream: simulateReadableStream({ chunks: text(BIG), initialDelayInMs: 0, chunkDelayInMs: 0 }) }
+      if (call === 2) throw transient("prompt is too long", { statusCode: 400, isRetryable: false })
+      const chunks = call === 3 ? text("## Objective\n- recovered") : text("after compaction")
+      return { stream: simulateReadableStream({ chunks, initialDelayInMs: 0, chunkDelayInMs: 0 }) }
+    }) as never
+    const h = harness([], new MockLanguageModelV4({ doStream }))
+
+    const history = await h.run(
+      Effect.gen(function* () {
+        const store = yield* SessionStore
+        const session = yield* store.create({ title: "t", directory: h.directory })
+        const runner = yield* SessionRun
+        yield* runner.prompt({ sessionID: session.id, text: "first", sink: h.sink })
+        yield* runner.prompt({ sessionID: session.id, text: "second", sink: h.sink })
+        return yield* store.messages(session.id)
+      }),
+    )
+
+    expect(h.captured.compactions.map((c) => c.state)).toEqual(["started", "completed"])
+    expect(call).toBe(4)
+    expect(JSON.stringify(history)).toContain("after compaction")
+    h.cleanup()
+  })
+
+  test("surfaces the original failure when compaction cannot help", async () => {
+    // Nothing to summarize on the very first turn, so compaction declines.
+    const model = flaky(99, () => transient("prompt is too long", { statusCode: 400, isRetryable: false }), text("x"))
+    const h = harness([], model.model)
+
+    const failure = await prompt(h, "hi").then(
+      () => undefined,
+      (error: unknown) => error,
+    )
+
+    expect(String(failure)).toContain("too long")
+    h.cleanup()
+  })
+
+  test("does not take the turn down when the summarizer itself fails", async () => {
+    let call = 0
+    const doStream = (async () => {
+      call++
+      if (call === 1)
+        return { stream: simulateReadableStream({ chunks: overflowing, initialDelayInMs: 0, chunkDelayInMs: 0 }) }
+      // Every summarization attempt fails.
+      throw transient("upstream unavailable", { statusCode: 503 })
+    }) as never
+    const h = harness([], new MockLanguageModelV4({ doStream }))
+
+    const history = await prompt(h, "hi")
+
+    expect(h.captured.compactions.at(-1)?.state).toBe("skipped")
+    // The original turn survived intact, and no boundary was written.
+    expect(history[1]!.parts[0]).toMatchObject({ type: "text", text: BIG })
+    expect(history.some((entry) => entry.parts.some((part) => part.type === "compaction"))).toBe(false)
     h.cleanup()
   })
 })

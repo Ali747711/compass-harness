@@ -45,7 +45,26 @@ export const ToolPart = Schema.Struct({
 })
 export type ToolPart = typeof ToolPart.Type
 
-export const Part = Schema.Union([TextPart, ReasoningPart, ToolPart])
+/**
+ * A boundary in the conversation: everything before it has been replaced by
+ * `summary`, and `recent` is the verbatim tail that was kept.
+ *
+ * Stored rather than applied destructively. The full history stays on disk —
+ * this part only changes what gets rebuilt into provider messages, so a
+ * compaction is inspectable after the fact and never loses the original.
+ */
+export const CompactionPart = Schema.Struct({
+  id: PartID,
+  messageID: MessageID,
+  sessionID: SessionID,
+  type: Schema.Literal("compaction"),
+  summary: Schema.String,
+  /** Serialized turns kept verbatim after the summarized head. May be empty. */
+  recent: Schema.String,
+})
+export type CompactionPart = typeof CompactionPart.Type
+
+export const Part = Schema.Union([TextPart, ReasoningPart, ToolPart, CompactionPart])
 export type Part = typeof Part.Type
 
 /**

@@ -1,5 +1,6 @@
 import {
   partID as newPartID,
+  type CompactionPart,
   type MessageID,
   type Part,
   type SessionID,
@@ -10,11 +11,20 @@ import {
 import { jsonSchema, streamText, tool as aiTool, type LanguageModel, type ModelMessage, type ToolSet } from "ai"
 import { Context, Data, Effect, Layer } from "effect"
 import { prune } from "../context/pipeline"
-import { describe as describeProviderError } from "../provider/error"
-import { parseModel, resolveModel, type ModelRef } from "../provider/provider"
+import { classify, describe as describeProviderError } from "../provider/error"
+import { modelLimit, parseModel, resolveModel, type ModelRef } from "../provider/provider"
 import { toTokens } from "../provider/usage"
 import { ToolRegistry } from "../tool/registry"
 import { parameters } from "../tool/tool"
+import {
+  DEFAULT_KEEP_TOKENS,
+  SUMMARY_OUTPUT_TOKENS,
+  buildPrompt,
+  lastCompaction,
+  select,
+  summaryFits,
+} from "./compaction"
+import { isOverflow } from "./overflow"
 import { policy, type Attempt } from "./retry"
 import { SessionStore } from "./store"
 
@@ -32,6 +42,15 @@ export interface Sink {
    * unless something marks the boundary.
    */
   readonly retry: (attempt: Attempt) => void
+  /**
+   * The conversation is being summarized. Worth saying out loud: it costs a
+   * provider call, it takes a noticeable pause, and it silently changes what
+   * the model can still remember.
+   */
+  readonly compaction: (event: {
+    readonly state: "started" | "completed" | "skipped"
+    readonly reason?: string
+  }) => void
 }
 
 export interface RunInput {
@@ -53,6 +72,8 @@ export interface RunInput {
 export class ProviderFailure extends Data.TaggedError("ProviderFailure")<{
   readonly message: string
   readonly status?: number
+  /** The input did not fit. Compaction can fix this; a plain retry cannot. */
+  readonly overflow?: boolean
 }> {}
 
 export interface Interface {
@@ -91,7 +112,25 @@ interface HistoryEntry {
  */
 export function toModelMessages(history: readonly HistoryEntry[]): ModelMessage[] {
   const messages: ModelMessage[] = []
-  for (const entry of history) {
+
+  // A compaction replaces everything before it. The originals stay on disk —
+  // this only changes what the provider is shown — so the boundary is applied
+  // here at rebuild time rather than by deleting anything.
+  const boundary = lastCompaction(history)
+  const entries = boundary === undefined ? history : history.slice(boundary.index + 1)
+  if (boundary !== undefined) {
+    const part = boundary.part as CompactionPart
+    messages.push({
+      role: "user",
+      content: [
+        "This conversation was compacted. Here is a summary of everything before this point:",
+        part.summary,
+        ...(part.recent ? ["The most recent exchanges follow verbatim:", part.recent] : []),
+      ].join("\n\n"),
+    })
+  }
+
+  for (const entry of entries) {
     const text = entry.parts
       .filter((part): part is TextPart => part.type === "text")
       .map((part) => part.text)
@@ -234,7 +273,13 @@ export const layerWith = (resolve: ResolveModel) =>
             // point either, so a replay cannot double-write parts.
             Effect.retry(policy((attempt) => Effect.sync(() => input.sink.retry(attempt)))),
             Effect.tapError((error) => store.completeMessage({ id: assistant.id, error: error.message })),
-            Effect.mapError((error) => new ProviderFailure(describeProviderError(error))),
+            Effect.mapError(
+              (error) =>
+                new ProviderFailure({
+                  ...describeProviderError(error),
+                  ...(classify(error).type === "context_overflow" ? { overflow: true } : {}),
+                }),
+            ),
           )
 
           if (turn.text.length > 0) {
@@ -309,6 +354,90 @@ export const layerWith = (resolve: ResolveModel) =>
           { discard: true },
         )
 
+      /**
+       * Replaces the older half of the conversation with a summary.
+       *
+       * Runs as its own provider call with no tools — the summarizer has one
+       * job and giving it tools invites it to go and do the work instead.
+       * Returns false whenever compaction cannot help, and never throws: a
+       * failed compaction must leave the session exactly as it was, because the
+       * alternative is losing a conversation in the process of saving it.
+       */
+      const compact = (input: { readonly sessionID: SessionID; readonly ref: ModelRef; readonly sink: Sink }) =>
+        Effect.gen(function* () {
+          const history = yield* store.messages(input.sessionID)
+          const previous = lastCompaction(history)
+          const selected = select(history, DEFAULT_KEEP_TOKENS)
+          if (selected === undefined) return false
+
+          const prior = previous === undefined ? undefined : (previous.part as CompactionPart)
+          // Nothing older than the kept tail, and no prior summary to fold in:
+          // there is nothing for a summary to remove.
+          if (selected.head.length === 0 && prior === undefined) return false
+
+          const summaryPrompt = buildPrompt({
+            ...(prior === undefined ? {} : { previousSummary: prior.summary }),
+            context: [prior?.recent ?? "", selected.head].filter(Boolean),
+          })
+
+          const limit = modelLimit(input.ref)
+          // The circular failure this avoids: compaction runs because context is
+          // full, and its prompt is built from that same context.
+          if (!summaryFits(summaryPrompt, limit)) {
+            input.sink.compaction({ state: "skipped", reason: "the conversation is too large to summarize" })
+            return false
+          }
+
+          input.sink.compaction({ state: "started" })
+          const summary = yield* Effect.tryPromise({
+            try: async () => {
+              const result = streamText({
+                model: resolve(input.ref),
+                messages: [{ role: "user", content: summaryPrompt }],
+                maxRetries: 0,
+                maxOutputTokens: SUMMARY_OUTPUT_TOKENS,
+                onError: () => {},
+              })
+              let text = ""
+              for await (const part of result.fullStream) {
+                if (part.type === "text-delta") text += part.text
+                if (part.type === "error")
+                  throw part.error instanceof Error ? part.error : new Error(String(part.error))
+              }
+              return text
+            },
+            catch: (cause) => (cause instanceof Error ? cause : new Error(String(cause))),
+          }).pipe(
+            Effect.retry(policy((attempt) => Effect.sync(() => input.sink.retry(attempt)))),
+            // A compaction that fails leaves the session untouched rather than
+            // taking the turn down with it.
+            Effect.catch(() => Effect.succeed("")),
+          )
+
+          if (summary.trim().length === 0) {
+            input.sink.compaction({ state: "skipped", reason: "the summary came back empty" })
+            return false
+          }
+
+          const marker = yield* store.appendMessage({
+            sessionID: input.sessionID,
+            role: "assistant",
+            providerID: input.ref.providerID,
+            modelID: input.ref.modelID,
+          })
+          yield* store.putPart({
+            id: newPartID(),
+            messageID: marker.id,
+            sessionID: input.sessionID,
+            type: "compaction",
+            summary,
+            recent: selected.recent,
+          })
+          yield* store.completeMessage({ id: marker.id })
+          input.sink.compaction({ state: "completed" })
+          return true
+        })
+
       const prompt: Interface["prompt"] = (input) =>
         Effect.gen(function* () {
           const session = yield* store.get(input.sessionID).pipe(Effect.orDie)
@@ -326,16 +455,31 @@ export const layerWith = (resolve: ResolveModel) =>
           })
           yield* store.completeMessage({ id: user.id })
 
+          const turn = { sessionID: input.sessionID, directory: session.directory, ref, sink: input.sink }
+
           let step = 0
           let needsContinuation = true
           while (needsContinuation && step < MAX_STEPS) {
-            needsContinuation = yield* runTurn({
-              sessionID: input.sessionID,
-              directory: session.directory,
-              ref,
-              sink: input.sink,
-            })
+            // Reactive path. The provider is the only authority on what fits, so
+            // an overflow it reports is compacted and the turn retried once.
+            // `retryable` deliberately refuses to retry these, because a plain
+            // retry re-sends the same oversized input — this retries a *smaller*
+            // one, which is a different thing.
+            const outcome = yield* Effect.result(runTurn(turn))
+            if (outcome._tag === "Failure") {
+              const failure = outcome.failure
+              if (failure.overflow !== true || !(yield* compact(turn))) return yield* Effect.fail(failure)
+              needsContinuation = yield* runTurn(turn)
+            } else {
+              needsContinuation = outcome.success
+            }
             step++
+
+            // Proactive path. Compacting between turns keeps the next request
+            // inside the window instead of discovering the limit by failing.
+            const history = yield* store.messages(input.sessionID)
+            const tokens = history.at(-1)?.info.tokens
+            if (isOverflow({ tokens, limit: modelLimit(ref) })) yield* compact(turn)
           }
         })
 

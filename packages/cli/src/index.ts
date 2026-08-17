@@ -95,6 +95,12 @@ const program = Effect.gen(function* () {
           `\n  ⟳ ${attempt.message} — retrying in ${seconds}s (${attempt.attempt}/${RETRY_MAX_RETRIES})\n`,
         )
       },
+      // Compaction is lossy and costs a provider call, so it is never silent.
+      compaction: (event) => {
+        if (event.state === "started") return process.stderr.write(`\n  ⊞ compacting the conversation…\n`)
+        if (event.state === "completed") return process.stderr.write(`  ⊞ compacted\n`)
+        process.stderr.write(`  ⊞ compaction skipped — ${event.reason ?? "no reason given"}\n`)
+      },
     },
   })
   process.stdout.write("\n")
