@@ -1,7 +1,7 @@
 import { APICallError } from "ai"
 import { MockLanguageModelV4, simulateReadableStream } from "ai/test"
 import { describe, expect, test } from "bun:test"
-import { Effect, Layer, Schema } from "effect"
+import { Effect, Fiber, Layer, Schema } from "effect"
 import { mkdtempSync, rmSync } from "node:fs"
 import { tmpdir } from "node:os"
 import { join } from "node:path"
@@ -427,6 +427,176 @@ describe("token accounting", () => {
     const history = await prompt(h, "hi")
 
     expect(history[1]!.info.tokens).toBeUndefined()
+    h.cleanup()
+  })
+})
+
+describe("interruption", () => {
+  /** A model that streams slowly enough to be interrupted partway. */
+  const slow = (before: string) =>
+    new MockLanguageModelV4({
+      doStream: (async () => ({
+        stream: simulateReadableStream({
+          chunks: [
+            { type: "text-start", id: "t0" },
+            { type: "text-delta", id: "t0", delta: before },
+            { type: "text-delta", id: "t0", delta: "never arrives" },
+            { type: "text-end", id: "t0" },
+            finish,
+          ],
+          initialDelayInMs: 0,
+          // The first delta lands well before the interrupt, the second well
+          // after — so the test distinguishes "kept what arrived" from "kept
+          // everything" rather than passing on either.
+          chunkDelayInMs: 150,
+        }),
+      })) as never,
+    })
+
+  const interruptAfter = (h: ReturnType<typeof harness>, ms: number) =>
+    Effect.gen(function* () {
+      const store = yield* SessionStore
+      const session = yield* store.create({ title: "t", directory: h.directory })
+      const runner = yield* SessionRun
+      const fiber = yield* Effect.forkChild(runner.prompt({ sessionID: session.id, text: "go", sink: h.sink }))
+      yield* Effect.sleep(`${ms} millis`)
+      yield* Fiber.interrupt(fiber)
+      return yield* store.messages(session.id)
+    })
+
+  test("keeps what had already streamed", async () => {
+    const h = harness([], slow("the part you saw"))
+    const history = await h.run(interruptAfter(h, 250))
+
+    // The user watched this arrive; discarding it would be a lie about what happened.
+    expect(JSON.stringify(history)).toContain("the part you saw")
+    expect(JSON.stringify(history)).not.toContain("never arrives")
+    h.cleanup()
+  })
+
+  test("closes the assistant message instead of leaving it open forever", async () => {
+    const h = harness([], slow("partial"))
+    const history = await h.run(interruptAfter(h, 250))
+
+    const assistant = history.find((entry) => entry.info.role === "assistant")
+    expect(assistant?.info.timeCompleted).toBeDefined()
+    expect(assistant?.info.finish).toBe("abort")
+    h.cleanup()
+  })
+
+  /**
+   * The reason this is not just tidiness: an unanswered tool_use is rejected by
+   * every provider and the store has no delete, so a tool left `running` by an
+   * interrupt would make the session permanently unusable.
+   */
+  test("leaves no tool part claiming to still be running", async () => {
+    let released: (() => void) | undefined
+    const hang = makeTool({
+      description: "blocks until aborted",
+      input: Schema.Struct({}),
+      execute: (_input, context) =>
+        Effect.promise(
+          () =>
+            new Promise<never>((_, reject) => {
+              released = () => reject(new Error("aborted"))
+              context.abort.addEventListener("abort", () => reject(new Error("aborted")))
+            }),
+        ) as never,
+    })
+    const h = harness([callTool("hang", {}), text("after")])
+    const layers = layerWith(() => h.script.model as never).pipe(
+      Layer.provideMerge(registryLayer([{ name: "hang", tool: hang }])),
+      Layer.provideMerge(inputLayer),
+      Layer.provideMerge(storeLayer),
+      Layer.provideMerge(layerAllowAll),
+      Layer.provideMerge(layerMemory),
+    )
+
+    const history = await Effect.runPromise(
+      Effect.gen(function* () {
+        const store = yield* SessionStore
+        const session = yield* store.create({ title: "t", directory: h.directory })
+        const runner = yield* SessionRun
+        const fiber = yield* Effect.forkChild(runner.prompt({ sessionID: session.id, text: "go", sink: h.sink }))
+        yield* Effect.sleep("300 millis")
+        yield* Fiber.interrupt(fiber)
+        return yield* store.messages(session.id)
+      }).pipe(Effect.provide(layers), Effect.scoped),
+    )
+    released?.()
+
+    const tools = history.flatMap((entry) => entry.parts).filter((part) => part.type === "tool")
+    expect(tools.length).toBeGreaterThan(0)
+    expect(tools.every((part) => (part as { state: string }).state !== "running")).toBe(true)
+    h.cleanup()
+  })
+
+  /** An in-flight tool is a promise Effect cannot reach into; it has to be signalled. */
+  test("signals a running tool rather than abandoning it", async () => {
+    let sawAbort = false
+    const watcher = makeTool({
+      description: "watches its abort signal",
+      input: Schema.Struct({}),
+      execute: (_input, context) =>
+        Effect.promise(
+          () =>
+            new Promise<never>((_, reject) => {
+              context.abort.addEventListener("abort", () => {
+                sawAbort = true
+                reject(new Error("aborted"))
+              })
+            }),
+        ) as never,
+    })
+    const h = harness([callTool("watcher", {}), text("after")])
+    const layers = layerWith(() => h.script.model as never).pipe(
+      Layer.provideMerge(registryLayer([{ name: "watcher", tool: watcher }])),
+      Layer.provideMerge(inputLayer),
+      Layer.provideMerge(storeLayer),
+      Layer.provideMerge(layerAllowAll),
+      Layer.provideMerge(layerMemory),
+    )
+
+    await Effect.runPromise(
+      Effect.gen(function* () {
+        const store = yield* SessionStore
+        const session = yield* store.create({ title: "t", directory: h.directory })
+        const runner = yield* SessionRun
+        const fiber = yield* Effect.forkChild(runner.prompt({ sessionID: session.id, text: "go", sink: h.sink }))
+        yield* Effect.sleep("300 millis")
+        yield* Fiber.interrupt(fiber)
+      }).pipe(Effect.provide(layers), Effect.scoped),
+    )
+
+    expect(sawAbort).toBe(true)
+    h.cleanup()
+  })
+
+  /** An interrupt is not a provider failure, so the retry schedule must not see it. */
+  test("does not retry an interrupted turn", async () => {
+    let calls = 0
+    const counting = new MockLanguageModelV4({
+      doStream: (async () => {
+        calls++
+        return {
+          stream: simulateReadableStream({
+            chunks: [
+              { type: "text-start", id: "t0" },
+              { type: "text-delta", id: "t0", delta: "x" },
+              { type: "text-end", id: "t0" },
+              finish,
+            ],
+            initialDelayInMs: 0,
+            chunkDelayInMs: 400,
+          }),
+        }
+      }) as never,
+    })
+    const h = harness([], counting)
+    await h.run(interruptAfter(h, 250))
+
+    expect(calls).toBe(1)
+    expect(h.captured.retries).toEqual([])
     h.cleanup()
   })
 })

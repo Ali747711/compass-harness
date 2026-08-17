@@ -295,6 +295,7 @@ export const layerWith = (resolve: ResolveModel) =>
         readonly directory: string
         readonly ref: ModelRef
         readonly sink: Sink
+        readonly abort: AbortSignal
       }) =>
         Effect.gen(function* () {
           const history = yield* store.messages(input.sessionID)
@@ -305,11 +306,21 @@ export const layerWith = (resolve: ResolveModel) =>
             modelID: input.ref.modelID,
           })
 
+          // Hoisted so an interrupt can persist whatever arrived before it. Reset
+          // at the top of each attempt, because the whole stream is retried and a
+          // replayed attempt must not inherit the previous one's blocks.
+          let blocks: Block[] = []
+
           const turn = yield* Effect.tryPromise({
-            try: async () => {
+            try: async (signal) => {
+              blocks = []
               const result = streamText({
                 model: resolve(input.ref),
                 system: SYSTEM,
+                // Interruption reaches the provider through here: Effect fires
+                // this signal when the fiber is interrupted, which ends the HTTP
+                // request rather than leaving it streaming into a dropped fiber.
+                abortSignal: signal,
                 // Prune tier 1 before the request: old tool results are shortened
                 // outside a protected recent window. A no-op under the threshold.
                 messages: prune(toModelMessages(history)).messages,
@@ -336,7 +347,6 @@ export const layerWith = (resolve: ResolveModel) =>
                * ordered — reason, call a tool, then explain — and flattening it
                * into "all the text" plus "all the calls" loses that.
                */
-              const blocks: Block[] = []
               /** SDK block id → index in `blocks`, for routing deltas. */
               const open = new Map<string, number>()
               /** Dedupes the pending notice; not every provider emits tool-input-start. */
@@ -450,6 +460,17 @@ export const layerWith = (resolve: ResolveModel) =>
             // resuming a half-read stream. Nothing has been persisted at this
             // point either, so a replay cannot double-write parts.
             Effect.retry(policy((attempt) => Effect.sync(() => input.sink.retry(attempt)))),
+            // Interruption is a cause, not a failure, so neither the retry
+            // schedule nor tapError sees it — which is right, but it also means
+            // nothing would otherwise close the message out. Whatever streamed
+            // before the interrupt is real and the user watched it arrive, so it
+            // is kept rather than discarded.
+            Effect.onInterrupt(() =>
+              Effect.gen(function* () {
+                yield* persistBlocks(blocks, assistant.id, input.sessionID)
+                yield* store.completeMessage({ id: assistant.id, error: "Interrupted", finish: "abort" })
+              }).pipe(Effect.ignore),
+            ),
             Effect.tapError((error) => store.completeMessage({ id: assistant.id, error: error.message })),
             Effect.mapError(
               (error) =>
@@ -461,6 +482,7 @@ export const layerWith = (resolve: ResolveModel) =>
           )
 
           // IDs are minted here, in block order, and never during the stream.
+          // (see persistBlocks for the same rule applied on the interrupt path)
           // Part IDs are monotonic ULIDs and both parts and messages are read
           // back sorted by id, so minting in order is what makes stored order
           // equal emitted order. Minting tool IDs later — as this did until now,
@@ -524,6 +546,7 @@ export const layerWith = (resolve: ResolveModel) =>
         })
 
       const settleCalls = (input: {
+        readonly abort: AbortSignal
         readonly sessionID: SessionID
         readonly directory: string
         readonly assistantID: MessageID
@@ -562,8 +585,7 @@ export const layerWith = (resolve: ResolveModel) =>
                   messageID: input.assistantID,
                   callID: call.id,
                   directory: input.directory,
-                  // Per-call abort arrives with interruption support in M2.
-                  abort: new AbortController().signal,
+                  abort: input.abort,
                 },
               })
 
@@ -607,7 +629,12 @@ export const layerWith = (resolve: ResolveModel) =>
        * failed compaction must leave the session exactly as it was, because the
        * alternative is losing a conversation in the process of saving it.
        */
-      const compact = (input: { readonly sessionID: SessionID; readonly ref: ModelRef; readonly sink: Sink }) =>
+      const compact = (input: {
+        readonly sessionID: SessionID
+        readonly ref: ModelRef
+        readonly sink: Sink
+        readonly abort: AbortSignal
+      }) =>
         Effect.gen(function* () {
           const history = yield* store.messages(input.sessionID)
           const previous = lastCompaction(history)
@@ -641,10 +668,11 @@ export const layerWith = (resolve: ResolveModel) =>
 
           input.sink.compaction({ state: "started" })
           const summary = yield* Effect.tryPromise({
-            try: async () => {
+            try: async (signal) => {
               const result = streamText({
                 model: resolve(input.ref),
                 messages: [{ role: "user", content: summaryPrompt }],
+                abortSignal: signal,
                 maxRetries: 0,
                 maxOutputTokens: SUMMARY_OUTPUT_TOKENS,
                 onError: () => {},
@@ -690,6 +718,28 @@ export const layerWith = (resolve: ResolveModel) =>
         })
 
       /**
+       * Writes text and reasoning blocks as parts, in order.
+       *
+       * Ids are minted here rather than during the stream, in array order —
+       * they are monotonic ULIDs and parts are read back sorted by id, so
+       * minting in order is what makes stored order equal emitted order.
+       */
+      const persistBlocks = (blocks: readonly Block[], messageID: MessageID, sessionID: SessionID) =>
+        Effect.forEach(
+          blocks.filter((block) => block.kind !== "tool" && block.text.length > 0),
+          (block) =>
+            store.putPart({
+              id: newPartID(),
+              messageID,
+              sessionID,
+              type: block.kind as "text" | "reasoning",
+              text: (block as { text: string }).text,
+              ...(block.kind === "reasoning" && block.metadata !== undefined ? { metadata: block.metadata } : {}),
+            }),
+          { discard: true },
+        )
+
+      /**
        * Turns a promoted prompt into a user message the model will see.
        *
        * The admitted record keeps its own id and the message adopts it, so the
@@ -714,109 +764,127 @@ export const layerWith = (resolve: ResolveModel) =>
         })
 
       const prompt: Interface["prompt"] = (input) =>
-        Effect.gen(function* () {
-          const session = yield* store.get(input.sessionID).pipe(Effect.orDie)
-          const ref = parseModel(input.model)
+        Effect.suspend(() => {
+          // One controller for the whole drain, created before the body so the
+          // interrupt hook below can reach it.
+          const controller = new AbortController()
+          return Effect.gen(function* () {
+            const session = yield* store.get(input.sessionID).pipe(Effect.orDie)
+            const ref = parseModel(input.model)
 
-          // Durable first, executed second. A crash between these two loses
-          // nothing: the prompt is on disk and the next drain picks it up.
-          yield* inputs.admit({
-            sessionID: input.sessionID,
-            prompt: { text: input.text, ...(input.model === undefined ? {} : { model: input.model }) },
-            delivery: input.delivery ?? "queue",
-          })
+            // Durable first, executed second. A crash between these two loses
+            // nothing: the prompt is on disk and the next drain picks it up.
+            yield* inputs.admit({
+              sessionID: input.sessionID,
+              prompt: { text: input.text, ...(input.model === undefined ? {} : { model: input.model }) },
+              delivery: input.delivery ?? "queue",
+            })
 
-          const turn = { sessionID: input.sessionID, directory: session.directory, ref, sink: input.sink }
+            const turn = {
+              sessionID: input.sessionID,
+              directory: session.directory,
+              ref,
+              sink: input.sink,
+              abort: controller.signal,
+            }
 
-          // Anything already waiting joins this drain — a steer admitted while
-          // the session was idle should not sit until the next prompt.
-          const initial = yield* inputs.promoteSteers(input.sessionID, yield* inputs.highWater(input.sessionID))
-          for (const admitted of initial) yield* materialize(admitted)
-          const first = yield* inputs.promoteNextQueued(input.sessionID)
-          if (first !== undefined) yield* materialize(first)
-          if (initial.length === 0 && first === undefined) return
+            // Anything already waiting joins this drain — a steer admitted while
+            // the session was idle should not sit until the next prompt.
+            const initial = yield* inputs.promoteSteers(input.sessionID, yield* inputs.highWater(input.sessionID))
+            for (const admitted of initial) yield* materialize(admitted)
+            const first = yield* inputs.promoteNextQueued(input.sessionID)
+            if (first !== undefined) yield* materialize(first)
+            if (initial.length === 0 && first === undefined) return
 
-          let step = 0
-          let shouldRun = true
-          while (shouldRun) {
-            let needsContinuation = true
-            while (needsContinuation && step < MAX_STEPS) {
-              // Reactive path. The provider is the only authority on what fits, so
-              // an overflow it reports is compacted and the turn retried once.
-              // `retryable` deliberately refuses to retry these, because a plain
-              // retry re-sends the same oversized input — this retries a *smaller*
-              // one, which is a different thing.
-              const outcome = yield* Effect.result(runTurn(turn))
-              // Counted before the recovery branch, and again after it, so both
-              // the failed turn and its retry charge against the cap — otherwise
-              // a session overflowing on every pass gets two turns per iteration
-              // and reaches 2 × MAX_STEPS worth of work.
-              //
-              // Summarizer calls are deliberately NOT charged. The cap bounds
-              // agent steps, not provider calls; charging compaction would give an
-              // overflowing session fewer real steps than a clean one, and in the
-              // recovery branch could trip the break below immediately after
-              // paying for a summary — abandoning the turn having gained nothing.
-              step++
-              if (outcome._tag === "Failure") {
-                const failure = outcome.failure
-                if (failure.overflow !== true || !(yield* compact(turn))) return yield* Effect.fail(failure)
-                if (step >= MAX_STEPS) break
-                needsContinuation = yield* runTurn(turn)
+            let step = 0
+            let shouldRun = true
+            while (shouldRun) {
+              let needsContinuation = true
+              while (needsContinuation && step < MAX_STEPS) {
+                // Reactive path. The provider is the only authority on what fits, so
+                // an overflow it reports is compacted and the turn retried once.
+                // `retryable` deliberately refuses to retry these, because a plain
+                // retry re-sends the same oversized input — this retries a *smaller*
+                // one, which is a different thing.
+                const outcome = yield* Effect.result(runTurn(turn))
+                // Counted before the recovery branch, and again after it, so both
+                // the failed turn and its retry charge against the cap — otherwise
+                // a session overflowing on every pass gets two turns per iteration
+                // and reaches 2 × MAX_STEPS worth of work.
+                //
+                // Summarizer calls are deliberately NOT charged. The cap bounds
+                // agent steps, not provider calls; charging compaction would give an
+                // overflowing session fewer real steps than a clean one, and in the
+                // recovery branch could trip the break below immediately after
+                // paying for a summary — abandoning the turn having gained nothing.
                 step++
-              } else {
-                needsContinuation = outcome.success
-              }
+                if (outcome._tag === "Failure") {
+                  const failure = outcome.failure
+                  if (failure.overflow !== true || !(yield* compact(turn))) return yield* Effect.fail(failure)
+                  if (step >= MAX_STEPS) break
+                  needsContinuation = yield* runTurn(turn)
+                  step++
+                } else {
+                  needsContinuation = outcome.success
+                }
 
-              // Proactive path. Compacting between turns keeps the next request
-              // inside the window instead of discovering the limit by failing.
-              const history = yield* store.messages(input.sessionID)
-              const tokens = history.at(-1)?.info.tokens
-              if (isOverflow({ tokens, limit: modelLimit(ref) })) yield* compact(turn)
+                // Proactive path. Compacting between turns keeps the next request
+                // inside the window instead of discovering the limit by failing.
+                const history = yield* store.messages(input.sessionID)
+                const tokens = history.at(-1)?.info.tokens
+                if (isOverflow({ tokens, limit: modelLimit(ref) })) yield* compact(turn)
 
-              // A safe turn boundary: the model has finished a thought and no tool
-              // is mid-flight. Steers land here and nowhere else, which is what
-              // makes "actually, use the other file" arrive without interleaving
-              // into a half-finished tool sequence.
-              if (!needsContinuation) {
-                // The cutoff is read here, at the boundary, not before the turn.
-                // Everything admitted while the turn ran belongs to this
-                // boundary; only what lands during promotion itself waits for
-                // the next one, which is what stops a steady stream of steers
-                // from looping here forever. opencode reads its cutoff at the
-                // same instant (runner/llm.ts:188).
-                const cutoff = yield* inputs.highWater(input.sessionID)
-                const steers = yield* inputs.promoteSteers(input.sessionID, cutoff)
-                if (steers.length > 0) {
-                  for (const admitted of steers) yield* materialize(admitted)
-                  needsContinuation = true
-                  // New instruction, fresh allowance — a batch resets it once, not
-                  // once per steer, so a burst cannot buy unbounded steps.
-                  step = 0
+                // A safe turn boundary: the model has finished a thought and no tool
+                // is mid-flight. Steers land here and nowhere else, which is what
+                // makes "actually, use the other file" arrive without interleaving
+                // into a half-finished tool sequence.
+                if (!needsContinuation) {
+                  // The cutoff is read here, at the boundary, not before the turn.
+                  // Everything admitted while the turn ran belongs to this
+                  // boundary; only what lands during promotion itself waits for
+                  // the next one, which is what stops a steady stream of steers
+                  // from looping here forever. opencode reads its cutoff at the
+                  // same instant (runner/llm.ts:188).
+                  const cutoff = yield* inputs.highWater(input.sessionID)
+                  const steers = yield* inputs.promoteSteers(input.sessionID, cutoff)
+                  if (steers.length > 0) {
+                    for (const admitted of steers) yield* materialize(admitted)
+                    needsContinuation = true
+                    // New instruction, fresh allowance — a batch resets it once, not
+                    // once per steer, so a burst cannot buy unbounded steps.
+                    step = 0
+                  }
                 }
               }
-            }
 
-            // Hitting the cap mid-task looks exactly like finishing: the loop
-            // returns, the CLI exits 0, and the reply simply stops. Say so, the
-            // same way a truncated reply is reported.
-            if (needsContinuation && step >= MAX_STEPS) {
-              input.sink.incomplete({
-                reason: "step-limit",
-                detail: `the turn reached its limit of ${MAX_STEPS} steps and stopped before finishing`,
-              })
-              return
-            }
+              // Hitting the cap mid-task looks exactly like finishing: the loop
+              // returns, the CLI exits 0, and the reply simply stops. Say so, the
+              // same way a truncated reply is reported.
+              if (needsContinuation && step >= MAX_STEPS) {
+                input.sink.incomplete({
+                  reason: "step-limit",
+                  detail: `the turn reached its limit of ${MAX_STEPS} steps and stopped before finishing`,
+                })
+                return
+              }
 
-            // Idle. Exactly one queued prompt promotes, so a backlog is worked
-            // through one at a time rather than concatenated into a single turn.
-            const next = yield* inputs.promoteNextQueued(input.sessionID)
-            shouldRun = next !== undefined
-            if (next !== undefined) {
-              yield* materialize(next)
-              step = 0
+              // Idle. Exactly one queued prompt promotes, so a backlog is worked
+              // through one at a time rather than concatenated into a single turn.
+              const next = yield* inputs.promoteNextQueued(input.sessionID)
+              shouldRun = next !== undefined
+              if (next !== undefined) {
+                yield* materialize(next)
+                step = 0
+              }
             }
-          }
+          }).pipe(
+            // Effect can end its own promises on interruption, but a tool already
+            // executing is a promise the runtime cannot reach into — bash has a
+            // child process, read has an open handle. Firing the controller is how
+            // they are told, and it is the same signal the provider call uses, so
+            // one Ctrl-C stops everything rather than the visible half.
+            Effect.onInterrupt(() => Effect.sync(() => controller.abort())),
+          )
         })
 
       return SessionRun.of({ prompt })

@@ -9,7 +9,7 @@ import { at, layer as locationsLayer } from "@compass/core/location/service-map"
 import { Spill } from "@compass/core/tool/spill"
 import { layerAllowAll } from "@compass/core/permission/permission"
 import { layer as projectLayer } from "@compass/core/project/project"
-import { Effect, Layer } from "effect"
+import { Cause, Effect, Exit, Fiber, Layer } from "effect"
 import { existsSync } from "node:fs"
 import { resolve } from "node:path"
 import { parseArgs } from "node:util"
@@ -172,7 +172,37 @@ function explain(error: unknown) {
   return fallback.length > 0 && fallback !== "[object Object]" ? fallback : "Failed for an unreported reason."
 }
 
-await Effect.runPromise(program.pipe(Effect.provide(MainLayer), Effect.scoped)).catch((error) => {
-  process.stderr.write(`${explain(error)}\n`)
-  process.exit(1)
+/**
+ * Run as an interruptible fiber rather than a bare promise.
+ *
+ * `Effect.runPromise` gives nothing to cancel, so Ctrl-C killed the process
+ * outright: every finalizer skipped, tool parts left marked running forever,
+ * the assistant message never closed, and whatever the model had already
+ * streamed thrown away. Forking gives an interrupt that unwinds properly —
+ * partial output is kept, in-flight tools are settled, and the child processes
+ * bash may have spawned are signalled instead of orphaned.
+ *
+ * A second Ctrl-C exits immediately, because a cleanup that itself hangs should
+ * not trap the user in their own terminal.
+ */
+const fiber = Effect.runFork(program.pipe(Effect.provide(MainLayer), Effect.scoped))
+
+let interrupting = false
+process.on("SIGINT", () => {
+  if (interrupting) {
+    process.stderr.write("\nForced.\n")
+    process.exit(130)
+  }
+  interrupting = true
+  process.stderr.write("\nInterrupting — finishing up, press Ctrl-C again to force.\n")
+  Effect.runFork(Fiber.interrupt(fiber))
 })
+
+const exit = await Effect.runPromise(Fiber.await(fiber))
+if (Exit.isFailure(exit)) {
+  // An interrupt is the user getting what they asked for, not a failure to
+  // report. 130 is the conventional code for it.
+  if (Cause.hasInterrupts(exit.cause)) process.exit(130)
+  process.stderr.write(`${explain(Cause.squash(exit.cause))}\n`)
+  process.exit(1)
+}
