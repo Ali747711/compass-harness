@@ -105,9 +105,20 @@ export function classify(cause: unknown): Classified {
     }
   }
 
-  const message = cause instanceof Error ? cause.message : String(cause)
+  // An Error with an empty message is worse than no error at all: it travels the
+  // whole way to the terminal and prints a blank line. Fall back through what is
+  // actually available rather than propagating "".
+  const raw = cause instanceof Error ? cause.message : String(cause)
+  const message = raw.trim().length > 0 ? raw : describeEmpty(cause)
   if (isContextOverflow(message)) return { type: "context_overflow", message }
   return { type: "unknown", message }
+}
+
+/** Last resort when a thrown value carries no usable message of its own. */
+function describeEmpty(cause: unknown): string {
+  const named = cause as { _tag?: unknown; name?: unknown }
+  const label = typeof named?._tag === "string" ? named._tag : typeof named?.name === "string" ? named.name : undefined
+  return label === undefined || label === "Error" ? "The provider call failed without reporting a reason." : label
 }
 
 /** `exactOptionalPropertyTypes` rejects an explicit `undefined`, so omit the key instead. */

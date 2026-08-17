@@ -1,6 +1,7 @@
 import { describe, expect, test } from "bun:test"
 import { APICallError } from "ai"
 import { classify, describe as explain, isContextOverflow } from "../src/provider/error"
+import { ProviderError, resolveModel } from "../src/provider/provider"
 import {
   RETRY_INITIAL_DELAY,
   RETRY_MAX_DELAY,
@@ -150,5 +151,47 @@ describe("describe", () => {
 
   test("says what to do about an overflow instead of just restating it", () => {
     expect(explain(apiError({ statusCode: 400, message: "prompt is too long" })).message).toContain("compaction")
+  })
+})
+
+describe("failures that carry no message", () => {
+  /**
+   * The worst possible terminal output is none. A missing API key used to exit 1
+   * having printed a blank line, because ProviderError carried its text in a
+   * field called `reason` while every layer downstream read `.message` — which
+   * Effect leaves empty unless the prop is literally named `message`.
+   */
+  test("a provider error states what is wrong", () => {
+    const error = new ProviderError({ providerID: "anthropic", message: "ANTHROPIC_API_KEY is not set." })
+    expect(error.message).toContain("ANTHROPIC_API_KEY")
+    expect(explain(error).message).toContain("ANTHROPIC_API_KEY")
+  })
+
+  test("a missing key is reported rather than thrown blank", () => {
+    const key = process.env["ANTHROPIC_API_KEY"]
+    delete process.env["ANTHROPIC_API_KEY"]
+    try {
+      expect(() => resolveModel({ providerID: "anthropic", modelID: "claude-sonnet-4-5" })).toThrow(
+        /ANTHROPIC_API_KEY is not set/,
+      )
+    } finally {
+      if (key !== undefined) process.env["ANTHROPIC_API_KEY"] = key
+    }
+  })
+
+  test("an unknown provider names the ones that exist", () => {
+    expect(() => resolveModel({ providerID: "banana", modelID: "x" })).toThrow(/anthropic, openai/)
+  })
+
+  /** Never propagate "" — it reaches the terminal and looks like success. */
+  test("classify substitutes something legible for an empty message", () => {
+    expect(classify(new Error("")).message.length).toBeGreaterThan(0)
+    expect(explain(new Error("")).message.length).toBeGreaterThan(0)
+  })
+
+  test("classify uses the tag when a tagged error has no message", () => {
+    class Silent extends ProviderError {}
+    const quiet = Object.assign(new Silent({ providerID: "p", message: "" }), {})
+    expect(classify(quiet).message).toContain("ProviderError")
   })
 })

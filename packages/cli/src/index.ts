@@ -128,9 +128,14 @@ function explain(error: unknown) {
   if (typeof error === "object" && error !== null && "message" in error) {
     const detail = String((error as { message: unknown }).message)
     // Effect wraps failures; take the first line so a cause dump never reaches the terminal.
-    return detail.split("\n")[0]!
+    const first = detail.split("\n")[0]!.trim()
+    // Never exit with a silent failure. An empty message here used to mean the
+    // process died having printed nothing, which is the least useful outcome
+    // available — worse than a stack trace, because it looks like success.
+    if (first.length > 0) return first
   }
-  return String(error)
+  const fallback = String(error).trim()
+  return fallback.length > 0 && fallback !== "[object Object]" ? fallback : "Failed for an unreported reason."
 }
 
 await Effect.runPromise(program.pipe(Effect.provide(MainLayer), Effect.scoped)).catch((error) => {

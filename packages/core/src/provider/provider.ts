@@ -3,9 +3,18 @@ import { createOpenAI } from "@ai-sdk/openai"
 import type { LanguageModel } from "ai"
 import { Data } from "effect"
 
+/**
+ * The provider could not even be constructed — no key, or a name we do not know.
+ *
+ * The field is `message`, not `reason`, and that is load-bearing rather than
+ * cosmetic. Effect's TaggedError populates `Error.message` from a `message`
+ * prop and leaves it empty otherwise, and every layer downstream — classify,
+ * describe, the CLI's explain — reads `.message`. Named anything else, a
+ * missing API key exits 1 having printed a blank line.
+ */
 export class ProviderError extends Data.TaggedError("ProviderError")<{
   readonly providerID: string
-  readonly reason: string
+  readonly message: string
 }> {}
 
 export interface ModelRef {
@@ -69,15 +78,26 @@ export function resolveModel(ref: ModelRef): LanguageModel {
   switch (ref.providerID) {
     case "anthropic": {
       const apiKey = process.env["ANTHROPIC_API_KEY"]
-      if (!apiKey) throw new ProviderError({ providerID: ref.providerID, reason: "ANTHROPIC_API_KEY is not set" })
+      if (!apiKey)
+        throw new ProviderError({
+          providerID: ref.providerID,
+          message: "ANTHROPIC_API_KEY is not set. Export it and try again.",
+        })
       return createAnthropic({ apiKey })(ref.modelID)
     }
     case "openai": {
       const apiKey = process.env["OPENAI_API_KEY"]
-      if (!apiKey) throw new ProviderError({ providerID: ref.providerID, reason: "OPENAI_API_KEY is not set" })
+      if (!apiKey)
+        throw new ProviderError({
+          providerID: ref.providerID,
+          message: "OPENAI_API_KEY is not set. Export it and try again.",
+        })
       return createOpenAI({ apiKey })(ref.modelID)
     }
     default:
-      throw new ProviderError({ providerID: ref.providerID, reason: `unknown provider "${ref.providerID}"` })
+      throw new ProviderError({
+        providerID: ref.providerID,
+        message: `Unknown provider "${ref.providerID}". Known providers: anthropic, openai.`,
+      })
   }
 }
