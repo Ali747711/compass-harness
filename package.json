@@ -9,7 +9,7 @@
     "packages/*"
   ],
   "scripts": {
-    "compass": "bun run --cwd packages/cli src/index.ts",
+    "compass": "bun packages/cli/src/index.ts",
     "typecheck": "bun run --filter '*' typecheck",
     "test": "bun run --filter '*' test",
     "lint": "oxlint",

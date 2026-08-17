@@ -9,6 +9,8 @@ import { Spill } from "@compass/core/tool/spill"
 import { layerAllowAll } from "@compass/core/permission/permission"
 import { layer as projectLayer } from "@compass/core/project/project"
 import { Effect, Layer } from "effect"
+import { existsSync } from "node:fs"
+import { resolve } from "node:path"
 import { parseArgs } from "node:util"
 
 /**
@@ -29,6 +31,7 @@ const { values, positionals } = parseArgs({
   options: {
     session: { type: "string", short: "s" },
     model: { type: "string", short: "m" },
+    directory: { type: "string", short: "C" },
     help: { type: "boolean", short: "h" },
   },
 })
@@ -42,8 +45,29 @@ Usage:
 Options:
   -s, --session <id>   continue an existing session
   -m, --model <ref>    provider/model (default: anthropic/claude-sonnet-4-5)
+  -C, --directory <p>  project directory (default: where you ran this)
   -h, --help           show this help
 `
+
+/**
+ * The directory this session is about.
+ *
+ * `process.cwd()` alone is not it. A launcher that chdirs — `bun run --cwd`, an
+ * npm script, a wrapper — moves the process without moving the user, and the
+ * session then scopes itself to the launcher's directory. That is not cosmetic:
+ * the directory selects the Location, which selects the tool registry and
+ * permissions, so every tool would operate on the wrong project while the paths
+ * shown look plausible.
+ *
+ * `PWD` is the shell's record of where the user actually is and survives a
+ * chdir, so it wins when it agrees with reality. `-C` overrides both.
+ */
+function projectDirectory(): string {
+  if (values.directory !== undefined) return resolve(values.directory)
+  const shell = process.env["PWD"]
+  if (shell !== undefined && existsSync(shell)) return shell
+  return process.cwd()
+}
 
 const program = Effect.gen(function* () {
   if (values.help || positionals.length === 0) {
@@ -76,7 +100,7 @@ const program = Effect.gen(function* () {
   }
   const session = values.session
     ? yield* store.get(SessionID.make(values.session))
-    : yield* store.create({ title: text.slice(0, 60), directory: process.cwd() })
+    : yield* store.create({ title: text.slice(0, 60), directory: projectDirectory() })
 
   if (!values.session) process.stderr.write(`session ${session.id}\n\n`)
 
