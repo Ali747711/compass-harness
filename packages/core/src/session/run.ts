@@ -71,40 +71,6 @@ export class SessionRun extends Context.Service<SessionRun, Interface>()("compas
  */
 export type ResolveModel = (ref: ModelRef) => LanguageModel
 
-/**
- * streamText exposes its results as promise properties. We consume only
- * fullStream, so on a failed request the other sixteen reject with no handler
- * attached and the runtime prints the whole cause — request body and system
- * prompt included — before our own error handling ever runs.
- */
-const RESULT_PROMISES = [
-  "text",
-  "finishReason",
-  "usage",
-  "totalUsage",
-  "response",
-  "steps",
-  "reasoning",
-  "reasoningText",
-  "content",
-  "warnings",
-  "providerMetadata",
-  "sources",
-  "files",
-  "toolCalls",
-  "toolResults",
-  "request",
-] as const
-
-function silenceUnconsumed(result: object) {
-  for (const key of RESULT_PROMISES) {
-    const value = (result as Record<string, unknown>)[key]
-    if (value && typeof (value as { catch?: unknown }).catch === "function") {
-      void (value as Promise<unknown>).catch(() => {})
-    }
-  }
-}
-
 /** Bounds runaway tool loops. M2 replaces this with a per-agent turn allowance. */
 const MAX_STEPS = 40
 
