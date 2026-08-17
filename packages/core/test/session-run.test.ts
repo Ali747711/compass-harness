@@ -2,11 +2,12 @@ import { APICallError } from "ai"
 import { MockLanguageModelV4, simulateReadableStream } from "ai/test"
 import { describe, expect, test } from "bun:test"
 import { Effect, Fiber, Layer, Schema } from "effect"
-import { mkdtempSync, rmSync } from "node:fs"
+import { mkdtempSync, rmSync, writeFileSync } from "node:fs"
 import { tmpdir } from "node:os"
 import { join } from "node:path"
 import { layerMemory } from "../src/database/database"
 import { layerAllowAll } from "../src/permission/permission"
+import { layer as projectLayer } from "../src/project/project"
 import { RETRY_MAX_RETRIES } from "../src/session/retry"
 import { SessionInput, layer as inputLayer } from "../src/session/input"
 import { SessionRun, layerWith, toModelMessages } from "../src/session/run"
@@ -53,8 +54,8 @@ const transient = (message: string, fields: Record<string, unknown> = {}) =>
 function scripted(turns: readonly Chunk[][]) {
   let turn = 0
   const prompts: unknown[] = []
-  const doStream = (async (options: { prompt: unknown }) => {
-    prompts.push(options.prompt)
+  const doStream = (async (opts: { prompt: unknown }) => {
+    prompts.push(opts.prompt)
     const chunks = turns[Math.min(turn, turns.length - 1)] ?? []
     turn++
     return { stream: simulateReadableStream({ chunks, initialDelayInMs: 0, chunkDelayInMs: 0 }) }
@@ -128,7 +129,8 @@ function harness(turns: readonly Chunk[][], override?: MockLanguageModelV4) {
     compactions: { state: string; reason?: string }[]
     incomplete: { reason: string; detail: string }[]
     reasoning: string[]
-  } = { text: [], tools: [], retries: [], compactions: [], incomplete: [], reasoning: [] }
+    instructions: string[]
+  } = { text: [], tools: [], retries: [], compactions: [], incomplete: [], reasoning: [], instructions: [] }
   const sink = {
     text: (delta: string) => captured.text.push(delta),
     tool: (event: { name: string; state: string }) => captured.tools.push({ name: event.name, state: event.state }),
@@ -137,6 +139,7 @@ function harness(turns: readonly Chunk[][], override?: MockLanguageModelV4) {
     compaction: (event: { state: string; reason?: string }) => captured.compactions.push(event),
     incomplete: (event: { reason: string; detail: string }) => captured.incomplete.push(event),
     reasoning: (delta: string) => captured.reasoning.push(delta),
+    instructions: (paths: readonly string[]) => captured.instructions.push(...paths),
   }
   const layers = layerWith(() => model as never).pipe(
     Layer.provideMerge(
@@ -147,6 +150,7 @@ function harness(turns: readonly Chunk[][], override?: MockLanguageModelV4) {
     ),
     Layer.provideMerge(inputLayer),
     Layer.provideMerge(storeLayer),
+    Layer.provideMerge(projectLayer),
     Layer.provideMerge(layerAllowAll),
     Layer.provideMerge(layerMemory),
   )
@@ -431,6 +435,53 @@ describe("token accounting", () => {
   })
 })
 
+describe("project instructions", () => {
+  /** The SDK turns `system` into a leading system message on the prompt. */
+  const systemOf = (prompt: unknown) => {
+    const messages = prompt as { role: string; content: unknown }[]
+    const system = messages.find((message) => message.role === "system")
+    return typeof system?.content === "string" ? system.content : ""
+  }
+
+  /**
+   * The whole point of the feature, and the thing that made opencode feel like
+   * it knew the project: the repo's own rules reach the model.
+   */
+  test("reaches the provider in the system prompt", async () => {
+    const h = harness([text("ok")])
+    writeFileSync(join(h.directory, "AGENTS.md"), "Always prefer tabs in this repo.")
+
+    await prompt(h, "hi")
+
+    // The SDK folds `system` into the prompt as a leading system message.
+    const system = systemOf(h.script.prompts.at(0))
+    expect(system).toContain("Always prefer tabs in this repo.")
+    expect(system).toContain("Instructions from:")
+    // Ours still leads; the project's rules follow so they can override.
+    expect(system.indexOf("You are compass")).toBeLessThan(system.indexOf("Always prefer tabs"))
+    h.cleanup()
+  })
+
+  test("names the files it is following rather than obeying them silently", async () => {
+    const h = harness([text("ok")])
+    writeFileSync(join(h.directory, "AGENTS.md"), "some rules")
+
+    await prompt(h, "hi")
+
+    expect(h.captured.instructions.some((path) => path.endsWith("AGENTS.md"))).toBe(true)
+    h.cleanup()
+  })
+
+  test("leaves the system prompt alone when the project has none", async () => {
+    const h = harness([text("ok")])
+    await prompt(h, "hi")
+
+    expect(systemOf(h.script.prompts.at(0))).toContain("You are compass")
+    expect(h.captured.instructions.filter((path) => path.startsWith(h.directory))).toEqual([])
+    h.cleanup()
+  })
+})
+
 describe("interruption", () => {
   /** A model that streams slowly enough to be interrupted partway. */
   const slow = (before: string) =>
@@ -508,6 +559,7 @@ describe("interruption", () => {
       Layer.provideMerge(registryLayer([{ name: "hang", tool: hang }])),
       Layer.provideMerge(inputLayer),
       Layer.provideMerge(storeLayer),
+      Layer.provideMerge(projectLayer),
       Layer.provideMerge(layerAllowAll),
       Layer.provideMerge(layerMemory),
     )
@@ -553,6 +605,7 @@ describe("interruption", () => {
       Layer.provideMerge(registryLayer([{ name: "watcher", tool: watcher }])),
       Layer.provideMerge(inputLayer),
       Layer.provideMerge(storeLayer),
+      Layer.provideMerge(projectLayer),
       Layer.provideMerge(layerAllowAll),
       Layer.provideMerge(layerMemory),
     )
@@ -1094,6 +1147,7 @@ describe("interrupted tool calls", () => {
       Layer.provideMerge(registryLayer([{ name: "hang", tool: hang }])),
       Layer.provideMerge(inputLayer),
       Layer.provideMerge(storeLayer),
+      Layer.provideMerge(projectLayer),
       Layer.provideMerge(layerAllowAll),
       Layer.provideMerge(layerMemory),
     )

@@ -126,6 +126,9 @@ const program = Effect.gen(function* () {
       // Reasoning goes to stderr, dimmed, so piping stdout still yields only the
       // answer — but the terminal is not silent while a reasoning model thinks.
       reasoning: (delta) => process.stderr.write(`\u001b[2m${delta}\u001b[0m`),
+      // Named, not just obeyed. An instruction file you forgot about changing
+      // the agent's behaviour is far more confusing than one you can see.
+      instructions: (paths) => process.stderr.write(`  ⌸ following ${paths.join(", ")}\n\n`),
       // Also stderr. A retry replays the turn, so whatever the failed attempt
       // already streamed to stdout is about to be said a second time — this
       // line is what makes that legible rather than baffling.

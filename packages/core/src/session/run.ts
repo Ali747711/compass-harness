@@ -15,6 +15,8 @@ import {
 import { jsonSchema, streamText, tool as aiTool, type LanguageModel, type ModelMessage, type ToolSet } from "ai"
 import { Context, Data, Effect, Layer } from "effect"
 import { prune } from "../context/pipeline"
+import { discover, render } from "../instruction/instruction"
+import { Project } from "../project/project"
 import { classify, describe as describeProviderError } from "../provider/error"
 import { modelLimit, parseModel, resolveModel, type ModelRef } from "../provider/provider"
 import { toTokens } from "../provider/usage"
@@ -50,6 +52,8 @@ export interface Sink {
    * The model is thinking. Reasoning models can spend a long time here emitting
    * nothing else, and without this the terminal looks hung.
    */
+  /** Which instruction files the session is following. Silent obedience is worse than none. */
+  readonly instructions: (paths: readonly string[]) => void
   readonly reasoning: (delta: string) => void
   readonly retry: (attempt: Attempt) => void
   /**
@@ -155,6 +159,15 @@ const SYSTEM = [
   "Use the provided tools to inspect and modify the user's project.",
   "Prefer reading files before editing them. Be concise in your replies.",
 ].join(" ")
+
+/**
+ * The project's own instructions, appended after ours.
+ *
+ * Last wins on a conflict, and the ordering is the point: a repository's
+ * AGENTS.md is more specific than anything generic said here, so it should
+ * override rather than be overridden.
+ */
+const systemPrompt = (instructions: string) => (instructions.length === 0 ? SYSTEM : `${SYSTEM}\n\n${instructions}`)
 
 interface HistoryEntry {
   readonly info: { readonly role: "user" | "assistant" }
@@ -269,6 +282,7 @@ export const layerWith = (resolve: ResolveModel) =>
     Effect.gen(function* () {
       const store = yield* SessionStore
       const inputs = yield* SessionInput
+      const projects = yield* Project
       const registry = yield* ToolRegistry
 
       /**
@@ -296,6 +310,7 @@ export const layerWith = (resolve: ResolveModel) =>
         readonly ref: ModelRef
         readonly sink: Sink
         readonly abort: AbortSignal
+        readonly instructions: string
       }) =>
         Effect.gen(function* () {
           const history = yield* store.messages(input.sessionID)
@@ -316,7 +331,7 @@ export const layerWith = (resolve: ResolveModel) =>
               blocks = []
               const result = streamText({
                 model: resolve(input.ref),
-                system: SYSTEM,
+                system: systemPrompt(input.instructions),
                 // Interruption reaches the provider through here: Effect fires
                 // this signal when the fiber is interrupted, which ends the HTTP
                 // request rather than leaving it streaming into a dropped fiber.
@@ -780,12 +795,20 @@ export const layerWith = (resolve: ResolveModel) =>
               delivery: input.delivery ?? "queue",
             })
 
+            // Read once per drain rather than per turn. Once is enough to pick
+            // up an edit made between prompts, and forty filesystem walks for a
+            // file that has not changed is forty walks wasted.
+            const project = yield* projects.resolve(session.directory)
+            const files = discover({ directory: session.directory, project: project.directory })
+            if (files.length > 0) input.sink.instructions(files.map((file) => file.path))
+
             const turn = {
               sessionID: input.sessionID,
               directory: session.directory,
               ref,
               sink: input.sink,
               abort: controller.signal,
+              instructions: render(files),
             }
 
             // Anything already waiting joins this drain — a steer admitted while
