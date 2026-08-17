@@ -57,6 +57,13 @@ export const migrations: readonly Migration[] = [
       `ALTER TABLE message ADD COLUMN tokens_total INTEGER`,
     ],
   },
+  {
+    // Why the provider stopped. Without it a reply truncated at the output limit
+    // is indistinguishable from a complete one, both in the record and at the
+    // moment the loop decides whether to continue.
+    name: "0002_message_finish",
+    statements: [`ALTER TABLE message ADD COLUMN finish TEXT`],
+  },
 ]
 
 export function migrate(db: BunDatabase) {

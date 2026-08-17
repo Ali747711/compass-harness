@@ -101,6 +101,9 @@ const program = Effect.gen(function* () {
         if (event.state === "completed") return process.stderr.write(`  ⊞ compacted\n`)
         process.stderr.write(`  ⊞ compaction skipped — ${event.reason ?? "no reason given"}\n`)
       },
+      // Otherwise the reply just stops, and a sentence ending mid-word looks
+      // like the model chose to stop there.
+      incomplete: (event) => process.stderr.write(`\n  ⚠ incomplete — ${event.detail}\n`),
     },
   })
   process.stdout.write("\n")

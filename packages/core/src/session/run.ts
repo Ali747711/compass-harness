@@ -1,4 +1,5 @@
 import {
+  INCOMPLETE_FINISH,
   partID as newPartID,
   type CompactionPart,
   type MessageID,
@@ -51,6 +52,12 @@ export interface Sink {
     readonly state: "started" | "completed" | "skipped"
     readonly reason?: string
   }) => void
+  /**
+   * The provider stopped before finishing a complete answer — output limit,
+   * content filter, or an error mid-generation. Nothing else distinguishes this
+   * from a normal reply; the text just stops.
+   */
+  readonly incomplete: (event: { readonly reason: string; readonly detail: string }) => void
 }
 
 export interface RunInput {
@@ -236,6 +243,7 @@ export const layerWith = (resolve: ResolveModel) =>
               })
               let text = ""
               let tokens: Tokens | undefined
+              let finish: string | undefined
               const calls: { id: string; name: string; input: unknown }[] = []
               for await (const part of result.fullStream) {
                 if (part.type === "text-delta") {
@@ -253,12 +261,13 @@ export const layerWith = (resolve: ResolveModel) =>
                 // whatever it had reported.
                 if (part.type === "finish") {
                   tokens = toTokens(part.totalUsage)
+                  finish = part.finishReason
                   continue
                 }
                 if (part.type === "error")
                   throw part.error instanceof Error ? part.error : new Error(String(part.error))
               }
-              return { text, calls, tokens }
+              return { text, calls, tokens, finish }
             },
             catch: (cause) => (cause instanceof Error ? cause : new Error(String(cause))),
           }).pipe(
@@ -292,7 +301,19 @@ export const layerWith = (resolve: ResolveModel) =>
             })
           }
 
-          const settled = turn.tokens === undefined ? { id: assistant.id } : { id: assistant.id, tokens: turn.tokens }
+          const settled = {
+            id: assistant.id,
+            ...(turn.tokens === undefined ? {} : { tokens: turn.tokens }),
+            ...(turn.finish === undefined ? {} : { finish: turn.finish }),
+          }
+
+          // A reply cut off at the output limit, refused by a content filter, or
+          // abandoned mid-generation is not a complete answer. Nothing else in
+          // the loop can tell — the text simply stops — so it is said plainly
+          // here rather than left for the user to infer from a sentence that
+          // ends mid-word.
+          const incomplete = turn.finish === undefined ? undefined : INCOMPLETE_FINISH[turn.finish]
+          if (incomplete !== undefined) input.sink.incomplete({ reason: turn.finish!, detail: incomplete })
 
           if (turn.calls.length === 0) {
             yield* store.completeMessage(settled)
@@ -301,7 +322,11 @@ export const layerWith = (resolve: ResolveModel) =>
 
           yield* settleCalls({ ...input, assistantID: assistant.id, calls: turn.calls })
           yield* store.completeMessage(settled)
-          return true
+          // Tool calls were made, so normally the model gets their results back.
+          // Not when the provider stopped for a reason that makes continuing
+          // pointless: a reply truncated at the output limit will truncate
+          // again, and a filtered one will filter again.
+          return incomplete === undefined
         })
 
       const settleCalls = (input: {
@@ -352,7 +377,25 @@ export const layerWith = (resolve: ResolveModel) =>
           // Sequential: parallel tool calls can touch the same files, and the
           // provider expects results in call order.
           { discard: true },
+        ).pipe(
+          // Every tool part is written `running` before execution, so anything
+          // that stops settleCalls part-way — a defect, an interrupt, the
+          // process dying — leaves parts claiming to be in flight forever.
+          // Nothing later ever revisits them: toModelMessages skips unsettled
+          // parts, so the model is shown a call with no result and silently
+          // loses the fact that it ever ran.
+          Effect.onExit(() => reconcile({ sessionID: input.sessionID, assistantID: input.assistantID })),
         )
+
+      /** Forces any still-running tool part of this message into a terminal state. */
+      const reconcile = (input: { readonly sessionID: SessionID; readonly assistantID: MessageID }) =>
+        Effect.gen(function* () {
+          const parts = yield* store.parts(input.assistantID)
+          for (const part of parts) {
+            if (part.type !== "tool" || (part.state !== "running" && part.state !== "pending")) continue
+            yield* store.putPart({ ...part, state: "error", error: "Tool execution was interrupted" })
+          }
+        }).pipe(Effect.ignore)
 
       /**
        * Replaces the older half of the conversation with a summary.
@@ -473,14 +516,20 @@ export const layerWith = (resolve: ResolveModel) =>
             // retry re-sends the same oversized input — this retries a *smaller*
             // one, which is a different thing.
             const outcome = yield* Effect.result(runTurn(turn))
+            // Counted before the recovery branch, and again after it. Every
+            // provider call has to charge against the cap or the cap is not one:
+            // a session that overflows on each pass would otherwise get two
+            // calls per iteration and reach 2 × MAX_STEPS.
+            step++
             if (outcome._tag === "Failure") {
               const failure = outcome.failure
               if (failure.overflow !== true || !(yield* compact(turn))) return yield* Effect.fail(failure)
+              if (step >= MAX_STEPS) break
               needsContinuation = yield* runTurn(turn)
+              step++
             } else {
               needsContinuation = outcome.success
             }
-            step++
 
             // Proactive path. Compacting between turns keeps the next request
             // inside the window instead of discovering the limit by failing.

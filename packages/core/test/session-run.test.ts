@@ -81,7 +81,14 @@ const usage = (input: { in?: number; out?: number; cacheRead?: number; cacheWrit
   },
 })
 
-const finish: Chunk = { type: "finish", finishReason: "stop", usage: usage({ in: 1, out: 1 }) } as Chunk
+/**
+ * Provider-level `finishReason` is an object carrying a `unified` field, not the
+ * bare string the top-level `fullStream` part exposes. Passing a string makes
+ * the SDK read `.unified` off it and hand us undefined.
+ */
+const reason = (unified: string) => ({ unified }) as never
+
+const finish: Chunk = { type: "finish", finishReason: reason("stop"), usage: usage({ in: 1, out: 1 }) } as Chunk
 
 const text = (value: string): Chunk[] => [
   { type: "text-start", id: "t0" },
@@ -90,7 +97,7 @@ const text = (value: string): Chunk[] => [
   finish,
 ]
 
-const finishWith = (reason: string): Chunk => ({ ...(finish as object), finishReason: reason }) as Chunk
+const finishWith = (unified: string): Chunk => ({ ...(finish as object), finishReason: reason(unified) }) as Chunk
 
 const callTool = (name: string, input: unknown): Chunk[] => [
   { type: "tool-call", toolCallId: "call_1", toolName: name, input: JSON.stringify(input) },
@@ -118,13 +125,15 @@ function harness(turns: readonly Chunk[][], override?: MockLanguageModelV4) {
     tools: { name: string; state: string }[]
     retries: { attempt: number; message: string }[]
     compactions: { state: string; reason?: string }[]
-  } = { text: [], tools: [], retries: [], compactions: [] }
+    incomplete: { reason: string; detail: string }[]
+  } = { text: [], tools: [], retries: [], compactions: [], incomplete: [] }
   const sink = {
     text: (delta: string) => captured.text.push(delta),
     tool: (event: { name: string; state: string }) => captured.tools.push({ name: event.name, state: event.state }),
     retry: (attempt: { attempt: number; message: string }) =>
       captured.retries.push({ attempt: attempt.attempt, message: attempt.message }),
     compaction: (event: { state: string; reason?: string }) => captured.compactions.push(event),
+    incomplete: (event: { reason: string; detail: string }) => captured.incomplete.push(event),
   }
   const layers = layerWith(() => model as never).pipe(
     Layer.provideMerge(
@@ -335,7 +344,11 @@ describe("token accounting", () => {
         { type: "text-start", id: "t0" },
         { type: "text-delta", id: "t0", delta: "hi" },
         { type: "text-end", id: "t0" },
-        { type: "finish", finishReason: "stop", usage: usage({ in: 9_000, out: 300, cacheRead: 8_000 }) } as Chunk,
+        {
+          type: "finish",
+          finishReason: reason("stop"),
+          usage: usage({ in: 9_000, out: 300, cacheRead: 8_000 }),
+        } as Chunk,
       ],
     ])
     const history = await prompt(h, "hi")
@@ -351,12 +364,114 @@ describe("token accounting", () => {
         { type: "text-start", id: "t0" },
         { type: "text-delta", id: "t0", delta: "hi" },
         { type: "text-end", id: "t0" },
-        { type: "finish", finishReason: "stop", usage: usage({}) } as Chunk,
+        { type: "finish", finishReason: reason("stop"), usage: usage({}) } as Chunk,
       ],
     ])
     const history = await prompt(h, "hi")
 
     expect(history[1]!.info.tokens).toBeUndefined()
+    h.cleanup()
+  })
+})
+
+describe("finish reasons", () => {
+  const stopping = (reason: string): Chunk[] => [
+    { type: "text-start", id: "t0" },
+    { type: "text-delta", id: "t0", delta: "partial answer that stops mid-" },
+    { type: "text-end", id: "t0" },
+    finishWith(reason),
+  ]
+
+  test("records why the provider stopped", async () => {
+    const h = harness([text("done")])
+    const history = await prompt(h, "hi")
+    expect(history[1]!.info.finish).toBe("stop")
+    h.cleanup()
+  })
+
+  /**
+   * A reply cut off at the output limit reads exactly like a complete one — the
+   * text just ends. Without this the only signal is a sentence stopping
+   * mid-word, which is indistinguishable from the model choosing to stop.
+   */
+  test("says so when the reply was truncated at the output limit", async () => {
+    const h = harness([stopping("length")])
+    const history = await prompt(h, "hi")
+
+    expect(history[1]!.info.finish).toBe("length")
+    expect(h.captured.incomplete.at(0)?.reason).toBe("length")
+    expect(h.captured.incomplete.at(0)?.detail).toContain("output limit")
+    h.cleanup()
+  })
+
+  test("says so when a content filter stopped the reply", async () => {
+    const h = harness([stopping("content-filter")])
+    await prompt(h, "hi")
+    expect(h.captured.incomplete.at(0)?.reason).toBe("content-filter")
+    h.cleanup()
+  })
+
+  test("stays quiet on an ordinary stop", async () => {
+    const h = harness([text("all done")])
+    await prompt(h, "hi")
+    expect(h.captured.incomplete).toEqual([])
+    h.cleanup()
+  })
+
+  /**
+   * Continuing would re-run the same request and truncate at the same place.
+   * Deciding purely on "were there tool calls" would loop until MAX_STEPS.
+   */
+  test("does not continue past a truncated turn even though it made tool calls", async () => {
+    const truncatedToolCall: Chunk[] = [
+      { type: "tool-call", toolCallId: "call_1", toolName: "echo", input: JSON.stringify({ value: "x" }) },
+      finishWith("length"),
+    ]
+    await withHarness([truncatedToolCall], async (h) => {
+      await prompt(h, "go")
+      // One provider call, not forty.
+      expect(h.script.turns()).toBe(1)
+      expect(h.captured.incomplete.at(0)?.reason).toBe("length")
+    })
+  })
+})
+
+describe("interrupted tool calls", () => {
+  /**
+   * Tool parts are written `running` before execution. Anything that stops the
+   * settle loop part-way leaves them claiming to be in flight forever, and
+   * toModelMessages skips unsettled parts — so the model sees a call it made
+   * with no result, and loses the fact that it ever ran.
+   */
+  test("forces a part left mid-flight into a terminal state", async () => {
+    const hang = makeTool({
+      description: "dies during execution",
+      input: Schema.Struct({}),
+      // A defect, not a ToolFailure: this escapes settle's normal error path.
+      execute: () => Effect.die(new Error("process fell over")),
+    })
+    const h = harness([callTool("hang", {}), text("after")])
+    const layers = layerWith(() => h.script.model as never).pipe(
+      Layer.provideMerge(registryLayer([{ name: "hang", tool: hang }])),
+      Layer.provideMerge(storeLayer),
+      Layer.provideMerge(layerAllowAll),
+      Layer.provideMerge(layerMemory),
+    )
+
+    const history = await Effect.runPromise(
+      Effect.gen(function* () {
+        const store = yield* SessionStore
+        const session = yield* store.create({ title: "t", directory: h.directory })
+        const runner = yield* SessionRun
+        yield* runner.prompt({ sessionID: session.id, text: "go", sink: h.sink }).pipe(Effect.ignore)
+        return yield* store.messages(session.id)
+      }).pipe(Effect.provide(layers), Effect.scoped),
+    )
+
+    const toolParts = history.flatMap((entry) => entry.parts).filter((part) => part.type === "tool")
+    expect(toolParts.length).toBeGreaterThan(0)
+    // Nothing is left claiming to still be running.
+    expect(toolParts.every((part) => part.state === "completed" || part.state === "error")).toBe(true)
     h.cleanup()
   })
 })
@@ -375,7 +490,7 @@ describe("compaction", () => {
     { type: "text-start", id: "t0" },
     { type: "text-delta", id: "t0", delta: BIG },
     { type: "text-end", id: "t0" },
-    { type: "finish", finishReason: "stop", usage: usage({ in: 150_000, out: 500 }) } as Chunk,
+    { type: "finish", finishReason: reason("stop"), usage: usage({ in: 150_000, out: 500 }) } as Chunk,
   ]
 
   test("summarizes once reported usage crosses the model's usable budget", async () => {

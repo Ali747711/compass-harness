@@ -36,6 +36,7 @@ export const MessageTable = sqliteTable(
     tokens_cache_read: integer(),
     tokens_cache_write: integer(),
     tokens_total: integer(),
+    finish: text(),
   },
   (table) => [index("message_session_idx").on(table.session_id, table.id)],
 )

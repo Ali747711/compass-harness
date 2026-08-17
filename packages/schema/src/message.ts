@@ -98,8 +98,25 @@ export const Message = Schema.Struct({
   modelID: Schema.optionalKey(Schema.String),
   error: Schema.optionalKey(Schema.String),
   tokens: Schema.optionalKey(Tokens),
+  /**
+   * Why the provider stopped. Durable rather than transient, because it is the
+   * only way to tell a complete reply from a truncated one after the fact.
+   *
+   * Left as a free string: the AI SDK's own union is `stop | length |
+   * content-filter | tool-calls | error | other`, but providers invent values
+   * and a decode failure here would lose the whole message over a field that is
+   * advisory.
+   */
+  finish: Schema.optionalKey(Schema.String),
 })
 export type Message = typeof Message.Type
+
+/** Finish reasons that mean the reply is not a complete answer. */
+export const INCOMPLETE_FINISH: Record<string, string> = {
+  length: "the reply hit the model's output limit and was cut off",
+  "content-filter": "the provider's content filter stopped the reply",
+  error: "the provider reported an error while generating",
+}
 
 /**
  * How much of the context window a turn occupied.

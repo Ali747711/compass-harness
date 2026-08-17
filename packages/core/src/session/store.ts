@@ -31,7 +31,12 @@ export interface Interface {
     providerID?: string
     modelID?: string
   }) => Effect.Effect<Message>
-  readonly completeMessage: (input: { id: MessageID; error?: string; tokens?: Tokens }) => Effect.Effect<void>
+  readonly completeMessage: (input: {
+    id: MessageID
+    error?: string
+    tokens?: Tokens
+    finish?: string
+  }) => Effect.Effect<void>
   readonly putPart: (part: Part) => Effect.Effect<void>
   readonly parts: (messageID: MessageID) => Effect.Effect<readonly Part[]>
   readonly messages: (sessionID: SessionID) => Effect.Effect<readonly { info: Message; parts: readonly Part[] }[]>
@@ -62,6 +67,7 @@ export const layer = Layer.effect(
       ...(row.provider_id === null ? {} : { providerID: row.provider_id }),
       ...(row.model_id === null ? {} : { modelID: row.model_id }),
       ...(row.error === null ? {} : { error: row.error }),
+      ...(row.finish === null ? {} : { finish: row.finish }),
       ...toTokens(row),
     })
 
@@ -152,6 +158,7 @@ export const layer = Layer.effect(
             .set({
               time_completed: Date.now(),
               error: input.error ?? null,
+              ...(input.finish === undefined ? {} : { finish: input.finish }),
               // Left untouched when the provider reported nothing, rather than
               // written as zeroes — see toTokens.
               ...(input.tokens === undefined
