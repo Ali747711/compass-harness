@@ -464,6 +464,43 @@ describe("compaction", () => {
     h.cleanup()
   })
 
+  /**
+   * Compaction has to shrink monotonically. If the second pass re-reads history
+   * the first pass already replaced, each summary prompt is bigger than the last
+   * — and within a couple of rounds it trips the summaryFits guard and stops
+   * compacting entirely, which is exactly when it is most needed.
+   */
+  test("summarizes only what happened since the last boundary", async () => {
+    const prompts: string[] = []
+    let call = 0
+    const doStream = (async (options: { prompt: unknown }) => {
+      call++
+      prompts.push(JSON.stringify(options.prompt))
+      // Odd calls are real turns that overflow; even calls are the summarizer.
+      const chunks = call % 2 === 1 ? overflowing : text(`## Objective\n- summary-${call}`)
+      return { stream: simulateReadableStream({ chunks, initialDelayInMs: 0, chunkDelayInMs: 0 }) }
+    }) as never
+    const h = harness([], new MockLanguageModelV4({ doStream }))
+
+    await h.run(
+      Effect.gen(function* () {
+        const store = yield* SessionStore
+        const session = yield* store.create({ title: "t", directory: h.directory })
+        const runner = yield* SessionRun
+        yield* runner.prompt({ sessionID: session.id, text: "ORIGINAL-FIRST-TURN", sink: h.sink })
+        yield* runner.prompt({ sessionID: session.id, text: "second", sink: h.sink })
+      }),
+    )
+
+    expect(h.captured.compactions.filter((c) => c.state === "completed").length).toBeGreaterThanOrEqual(2)
+    // The summarizer prompts are the even-numbered calls. The later one must not
+    // be re-reading the turn the earlier one already replaced.
+    const summarizerPrompts = prompts.filter((_, index) => (index + 1) % 2 === 0)
+    expect(summarizerPrompts.length).toBeGreaterThanOrEqual(2)
+    expect(summarizerPrompts.at(-1)).not.toContain("ORIGINAL-FIRST-TURN")
+    h.cleanup()
+  })
+
   test("surfaces the original failure when compaction cannot help", async () => {
     // Nothing to summarize on the very first turn, so compaction declines.
     const model = flaky(99, () => transient("prompt is too long", { statusCode: 400, isRetryable: false }), text("x"))

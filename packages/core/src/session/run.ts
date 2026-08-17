@@ -367,7 +367,14 @@ export const layerWith = (resolve: ResolveModel) =>
         Effect.gen(function* () {
           const history = yield* store.messages(input.sessionID)
           const previous = lastCompaction(history)
-          const selected = select(history, DEFAULT_KEEP_TOKENS)
+
+          // Only what has happened since the last boundary. Everything older was
+          // already replaced by `prior.summary`, and feeding it back in would
+          // make each compaction larger than the one before it — the opposite of
+          // the point, and large enough by the second or third to fail the
+          // summaryFits guard and stop compacting at all.
+          const since = previous === undefined ? history : history.slice(previous.index + 1)
+          const selected = select(since, DEFAULT_KEEP_TOKENS)
           if (selected === undefined) return false
 
           const prior = previous === undefined ? undefined : (previous.part as CompactionPart)
