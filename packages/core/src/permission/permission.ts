@@ -1,4 +1,5 @@
 import { Context, Data, Effect, Layer } from "effect"
+import { evaluate, type Rule, type Ruleset } from "./ruleset"
 
 export class PermissionDenied extends Data.TaggedError("PermissionDenied")<{
   readonly permission: string
@@ -52,6 +53,39 @@ export const layerRecording = (log: Request[]) =>
       ask: (request) =>
         Effect.sync(() => {
           log.push(request)
+        }),
+    }),
+  )
+
+/**
+ * A Permission backed by a ruleset.
+ *
+ * `deny` refuses, `allow` grants, and `ask` defers to `onAsk` — which defaults
+ * to granting, because there is no interactive prompt yet and a CLI that
+ * blocked on an unanswerable question would simply hang. That default is the
+ * honest description of where this is: deny rules have teeth, ask does not, and
+ * the seam is here so a TUI can supply a real prompt without touching a tool.
+ *
+ * Every request is checked against every pattern it carries. One denied pattern
+ * denies the request — a `write` touching two paths where one is forbidden is a
+ * forbidden write, not a partly-allowed one.
+ */
+export const layerRuleset = (input: {
+  ruleset: Ruleset
+  onAsk?: (request: Request, rule: Rule) => Effect.Effect<boolean>
+}) =>
+  Layer.sync(Permission, () =>
+    Permission.of({
+      ask: (request) =>
+        Effect.gen(function* () {
+          const patterns = request.patterns.length > 0 ? request.patterns : ["*"]
+          for (const pattern of patterns) {
+            const rule = evaluate(request.permission, pattern, input.ruleset)
+            if (rule.action === "allow") continue
+            if (rule.action === "deny") return yield* new PermissionDenied({ permission: request.permission, pattern })
+            const granted = input.onAsk === undefined ? true : yield* input.onAsk(request, rule)
+            if (!granted) return yield* new PermissionDenied({ permission: request.permission, pattern })
+          }
         }),
     }),
   )
