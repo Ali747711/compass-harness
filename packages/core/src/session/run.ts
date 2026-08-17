@@ -98,6 +98,10 @@ export class SessionRun extends Context.Service<SessionRun, Interface>()("compas
  */
 export type ResolveModel = (ref: ModelRef) => LanguageModel
 
+/** The most useful line an unknown thrown value has to offer. */
+const errorText = (cause: unknown) =>
+  cause instanceof Error ? cause.message : typeof cause === "string" ? cause : "the model sent an unparsable tool call"
+
 /** Bounds runaway tool loops. M2 replaces this with a per-agent turn allowance. */
 const MAX_STEPS = 40
 
@@ -152,24 +156,44 @@ export function toModelMessages(history: readonly HistoryEntry[]): ModelMessage[
     const content: Extract<ModelMessage, { role: "assistant" }>["content"] = []
     if (text.length > 0) content.push({ type: "text", text })
     for (const part of tools) {
-      content.push({ type: "tool-call", toolCallId: part.callID, toolName: part.tool, input: part.input ?? {} })
+      // A malformed call has the raw argument *string* as its input. Replaying
+      // that produces a tool_use whose input is not an object, which providers
+      // reject — and the store has no delete, so it would be permanent. The SDK
+      // guards the same case when it rebuilds history.
+      const input = typeof part.input === "object" && part.input !== null ? part.input : {}
+      content.push({ type: "tool-call", toolCallId: part.callID, toolName: part.tool, input })
     }
     if (content.length > 0) messages.push({ role: "assistant", content })
 
     // Tool results are a separate provider message and must follow the call
     // that produced them, in the same order.
-    const settled = tools.filter((part) => part.state === "completed" || part.state === "error")
-    if (settled.length === 0) continue
+    //
+    // Every call gets a result, including ones that never settled. Anthropic and
+    // OpenAI both hard-reject an assistant turn carrying a tool_use with no
+    // matching tool_result, and that rejection is unrecoverable here: it is
+    // classified as a plain api_error so retry declines it, it is not an
+    // overflow so compaction never runs, and the store has no delete — so the
+    // bad turn is replayed identically on every future prompt and the session is
+    // permanently unusable. `reconcile` settles these at the end of a turn, but
+    // it is an Effect finalizer and a SIGKILL skips it. This is the layer that
+    // makes a stranded part survivable rather than fatal.
+    if (tools.length === 0) continue
     messages.push({
       role: "tool",
-      content: settled.map((part) => ({
+      content: tools.map((part) => ({
         type: "tool-result" as const,
         toolCallId: part.callID,
         toolName: part.tool,
         output:
-          part.state === "error"
-            ? { type: "error-text" as const, value: part.error ?? "tool failed" }
-            : { type: "text" as const, value: part.output ?? "" },
+          part.state === "completed"
+            ? { type: "text" as const, value: part.output ?? "" }
+            : {
+                type: "error-text" as const,
+                value:
+                  part.state === "error"
+                    ? (part.error ?? "tool failed")
+                    : "[Tool execution was interrupted and produced no result]",
+              },
       })),
     })
   }
@@ -244,7 +268,7 @@ export const layerWith = (resolve: ResolveModel) =>
               let text = ""
               let tokens: Tokens | undefined
               let finish: string | undefined
-              const calls: { id: string; name: string; input: unknown }[] = []
+              const calls: { id: string; name: string; input: unknown; error?: string }[] = []
               for await (const part of result.fullStream) {
                 if (part.type === "text-delta") {
                   text += part.text
@@ -252,9 +276,23 @@ export const layerWith = (resolve: ResolveModel) =>
                   continue
                 }
                 if (part.type === "tool-call") {
-                  calls.push({ id: part.toolCallId, name: part.toolName, input: part.input })
+                  // The SDK flags a call whose arguments would not parse and
+                  // hands back the raw string plus an InvalidToolInputError that
+                  // names the offending field. Running it through the registry
+                  // would discard that for a vaguer decoder message and cost a
+                  // pointless dispatch for what may be a hallucinated tool.
+                  const invalid = part.invalid === true
+                  calls.push({
+                    id: part.toolCallId,
+                    name: part.toolName,
+                    input: part.input,
+                    ...(invalid ? { error: errorText(part.error) } : {}),
+                  })
                   continue
                 }
+                // Paired with an invalid tool-call, which already carried the
+                // error. Skipped rather than handled twice.
+                if (part.type === "tool-error") continue
                 // The provider's own accounting, and the only trustworthy input
                 // to overflow detection. Read here rather than awaited off the
                 // result promise so a stream that errors partway still leaves
@@ -334,7 +372,7 @@ export const layerWith = (resolve: ResolveModel) =>
         readonly directory: string
         readonly assistantID: MessageID
         readonly sink: Sink
-        readonly calls: readonly { id: string; name: string; input: unknown }[]
+        readonly calls: readonly { id: string; name: string; input: unknown; error?: string }[]
       }) =>
         Effect.forEach(
           input.calls,
@@ -350,6 +388,14 @@ export const layerWith = (resolve: ResolveModel) =>
                 tool: call.name,
                 input: call.input,
               }
+              // Already known bad before dispatch: record it and let the model
+              // see the error so it can correct itself on the next turn.
+              if (call.error !== undefined) {
+                yield* store.putPart({ ...base, state: "error", error: call.error })
+                input.sink.tool({ name: call.name, state: "error", title: call.error })
+                return
+              }
+
               yield* store.putPart({ ...base, state: "running" })
               input.sink.tool({ name: call.name, state: "running" })
 

@@ -201,24 +201,51 @@ describe("toModelMessages", () => {
     expect(messages.map((m) => m.role)).toEqual(["assistant", "tool"])
   })
 
-  test("omits a tool call that has not settled, so no result is promised", () => {
-    const messages = toModelMessages([
-      {
-        info: { role: "assistant" },
-        parts: [
-          {
-            id: "prt_1" as never,
-            messageID: "msg_1" as never,
-            sessionID: "ses_1" as never,
-            type: "tool",
-            callID: "call_1",
-            tool: "echo",
-            state: "running",
-          },
-        ],
-      },
-    ])
-    expect(messages.map((m) => m.role)).toEqual(["assistant"])
+  /**
+   * A tool_use with no matching tool_result is rejected outright by Anthropic and
+   * OpenAI, and here that rejection is terminal: it classifies as a plain
+   * api_error so retry declines it, it is not an overflow so compaction never
+   * runs, and the store has no delete — so the same invalid turn is rebuilt on
+   * every later prompt and the session can never be used again.
+   *
+   * The previous version of this test asserted `["assistant"]` under the name
+   * "omits a tool call that has not settled". The name described the safe
+   * behaviour; the assertion pinned the unsafe one.
+   */
+  const unsettled = (state: "pending" | "running") => [
+    {
+      info: { role: "assistant" as const },
+      parts: [
+        {
+          id: "prt_1" as never,
+          messageID: "msg_1" as never,
+          sessionID: "ses_1" as never,
+          type: "tool" as const,
+          callID: "call_1",
+          tool: "echo",
+          state,
+        },
+      ],
+    },
+  ]
+
+  test("still answers a tool call that never settled, so the turn stays valid", () => {
+    for (const state of ["pending", "running"] as const) {
+      const messages = toModelMessages(unsettled(state))
+      expect(messages.map((m) => m.role)).toEqual(["assistant", "tool"])
+      const result = (messages[1] as { content: { output: { type: string; value: string } }[] }).content[0]!
+      expect(result.output.type).toBe("error-text")
+      expect(result.output.value).toContain("interrupted")
+    }
+  })
+
+  test("never emits a call without a matching result", () => {
+    const messages = toModelMessages(unsettled("running"))
+    const calls = (messages[0] as { content: { type: string; toolCallId?: string }[] }).content.filter(
+      (part) => part.type === "tool-call",
+    )
+    const results = (messages[1] as { content: { toolCallId: string }[] }).content
+    expect(results.map((r) => r.toolCallId).sort()).toEqual(calls.map((c) => c.toolCallId!).sort())
   })
 })
 
@@ -297,7 +324,13 @@ describe("the agent loop", () => {
 
     const toolPart = history.flatMap((entry) => entry.parts).find((part) => part.type === "tool")
     expect(toolPart).toMatchObject({ state: "error" })
-    expect(String((toolPart as { error?: string }).error)).toContain("Unknown tool")
+    // The SDK flags an unavailable tool before dispatch and names what IS
+    // available, which the registry's own "Unknown tool: x" could not. Since
+    // this text goes back to the model as the tool result, the difference is
+    // whether it can recover on the next turn or just guesses again.
+    const message = String((toolPart as { error?: string }).error)
+    expect(message).toContain("nonexistent")
+    expect(message).toContain("echo")
     h.cleanup()
   })
 
@@ -370,6 +403,62 @@ describe("token accounting", () => {
     const history = await prompt(h, "hi")
 
     expect(history[1]!.info.tokens).toBeUndefined()
+    h.cleanup()
+  })
+})
+
+describe("malformed tool calls", () => {
+  /**
+   * When the model emits unparsable arguments the SDK hands back the raw
+   * argument *string* as `input`, flagged `invalid`. Stored and replayed that
+   * becomes a tool_use whose input is not an object, which providers reject —
+   * and since the store has no delete, the session never recovers.
+   */
+  const malformed: Chunk[] = [
+    { type: "tool-call", toolCallId: "call_1", toolName: "echo", input: "{value:" } as Chunk,
+    finishWith("tool-calls"),
+  ]
+
+  test("records the SDK's own diagnosis rather than a vaguer one", async () => {
+    const h = harness([malformed, text("corrected")])
+    const history = await prompt(h, "go")
+
+    const toolPart = history.flatMap((entry) => entry.parts).find((part) => part.type === "tool") as {
+      state: string
+      error?: string
+    }
+    expect(toolPart.state).toBe("error")
+    // The SDK names the problem; the registry's schema decoder would not have.
+    expect(toolPart.error).toMatch(/JSON parsing failed|JSON Parse error/i)
+    // It names the tool and quotes the text that would not parse.
+    expect(toolPart.error).toContain("echo")
+    expect(toolPart.error).toContain("{value:")
+    h.cleanup()
+  })
+
+  test("never replays a tool input that is not an object", async () => {
+    const h = harness([malformed, text("corrected")])
+    await prompt(h, "go")
+
+    const replayed = JSON.stringify(h.script.prompts.at(-1))
+    expect(replayed).not.toContain('"input":"{value:"')
+    h.cleanup()
+  })
+
+  test("lets the model correct itself instead of ending the turn", async () => {
+    await withHarness([malformed, text("corrected")], async (h) => {
+      const history = await prompt(h, "go")
+      expect(h.script.turns()).toBeGreaterThanOrEqual(2)
+      expect(JSON.stringify(history)).toContain("corrected")
+    })
+  })
+
+  test("does not dispatch a malformed call to the registry", async () => {
+    // `echo` would succeed if reached, so a successful settlement proves dispatch.
+    const h = harness([malformed, text("done")])
+    const history = await prompt(h, "go")
+    const outputs = history.flatMap((e) => e.parts).filter((p) => p.type === "tool")
+    expect(outputs.every((p) => (p as { state: string }).state === "error")).toBe(true)
     h.cleanup()
   })
 })
