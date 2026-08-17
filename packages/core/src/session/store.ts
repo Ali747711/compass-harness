@@ -7,6 +7,7 @@ import {
   SessionID,
   messageID as newMessageID,
   sessionID as newSessionID,
+  type Tokens,
 } from "@compass/schema"
 import { asc, eq } from "drizzle-orm"
 import { Context, Effect, Layer, Schema } from "effect"
@@ -30,7 +31,7 @@ export interface Interface {
     providerID?: string
     modelID?: string
   }) => Effect.Effect<Message>
-  readonly completeMessage: (input: { id: MessageID; error?: string }) => Effect.Effect<void>
+  readonly completeMessage: (input: { id: MessageID; error?: string; tokens?: Tokens }) => Effect.Effect<void>
   readonly putPart: (part: Part) => Effect.Effect<void>
   readonly parts: (messageID: MessageID) => Effect.Effect<readonly Part[]>
   readonly messages: (sessionID: SessionID) => Effect.Effect<readonly { info: Message; parts: readonly Part[] }[]>
@@ -61,7 +62,26 @@ export const layer = Layer.effect(
       ...(row.provider_id === null ? {} : { providerID: row.provider_id }),
       ...(row.model_id === null ? {} : { modelID: row.model_id }),
       ...(row.error === null ? {} : { error: row.error }),
+      ...toTokens(row),
     })
+
+    /**
+     * Usage is written as one unit or not at all, so `tokens_input` alone
+     * decides whether the group is present. A partially-null group would mean
+     * a bug elsewhere, and inventing zeroes for it would hide that.
+     */
+    const toTokens = (row: typeof MessageTable.$inferSelect): { tokens?: Tokens } =>
+      row.tokens_input === null
+        ? {}
+        : {
+            tokens: {
+              input: row.tokens_input,
+              output: row.tokens_output ?? 0,
+              reasoning: row.tokens_reasoning ?? 0,
+              cache: { read: row.tokens_cache_read ?? 0, write: row.tokens_cache_write ?? 0 },
+              ...(row.tokens_total === null ? {} : { total: row.tokens_total }),
+            },
+          }
 
     const get: Interface["get"] = (id) =>
       Effect.sync(() => db.select().from(SessionTable).where(eq(SessionTable.id, id)).get()).pipe(
@@ -129,7 +149,22 @@ export const layer = Layer.effect(
       completeMessage: (input) =>
         Effect.sync(() => {
           db.update(MessageTable)
-            .set({ time_completed: Date.now(), error: input.error ?? null })
+            .set({
+              time_completed: Date.now(),
+              error: input.error ?? null,
+              // Left untouched when the provider reported nothing, rather than
+              // written as zeroes — see toTokens.
+              ...(input.tokens === undefined
+                ? {}
+                : {
+                    tokens_input: input.tokens.input,
+                    tokens_output: input.tokens.output,
+                    tokens_reasoning: input.tokens.reasoning,
+                    tokens_cache_read: input.tokens.cache.read,
+                    tokens_cache_write: input.tokens.cache.write,
+                    tokens_total: input.tokens.total ?? null,
+                  }),
+            })
             .where(eq(MessageTable.id, input.id))
             .run()
         }),

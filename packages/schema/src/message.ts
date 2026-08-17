@@ -48,6 +48,27 @@ export type ToolPart = typeof ToolPart.Type
 export const Part = Schema.Union([TextPart, ReasoningPart, ToolPart])
 export type Part = typeof Part.Type
 
+/**
+ * What a turn actually cost, as reported by the provider.
+ *
+ * The split is not cosmetic. `input` is the *non-cached* input only: the AI SDK
+ * normalizes `inputTokens` to include cache reads and writes, so the cached
+ * counts are subtracted back out here and carried separately. Anything deciding
+ * whether a conversation still fits must add them back — see `contextTokens`.
+ *
+ * Likewise `output` excludes `reasoning`, which providers bill and count
+ * separately even though it never appears in the reply.
+ */
+export const Tokens = Schema.Struct({
+  input: Schema.Number,
+  output: Schema.Number,
+  reasoning: Schema.Number,
+  cache: Schema.Struct({ read: Schema.Number, write: Schema.Number }),
+  /** The provider's own total, when it gave one. Authoritative over our sum. */
+  total: Schema.optionalKey(Schema.Number),
+})
+export type Tokens = typeof Tokens.Type
+
 export const Message = Schema.Struct({
   id: MessageID,
   sessionID: SessionID,
@@ -57,8 +78,23 @@ export const Message = Schema.Struct({
   providerID: Schema.optionalKey(Schema.String),
   modelID: Schema.optionalKey(Schema.String),
   error: Schema.optionalKey(Schema.String),
+  tokens: Schema.optionalKey(Tokens),
 })
 export type Message = typeof Message.Type
+
+/**
+ * How much of the context window a turn occupied.
+ *
+ * The provider's `total` wins when present. The fallback re-adds every part
+ * that was split out — including `reasoning`, which opencode's equivalent
+ * fallback omits (session/overflow.ts:32). Their `total` is almost always
+ * present so the omission rarely bites, but a reasoning-heavy turn on a
+ * provider that reports no total would read as smaller than it was, which is
+ * the one direction this number must never be wrong in.
+ */
+export function contextTokens(tokens: Tokens): number {
+  return tokens.total ?? tokens.input + tokens.output + tokens.reasoning + tokens.cache.read + tokens.cache.write
+}
 
 export const MessageWithParts = Schema.Struct({
   info: Message,

@@ -43,6 +43,20 @@ export const migrations: readonly Migration[] = [
       `CREATE INDEX part_message_idx ON part (message_id, id)`,
     ],
   },
+  {
+    // Token accounting. Nullable rather than DEFAULT 0: a turn that failed
+    // before the provider reported usage genuinely has no counts, and zero is a
+    // lie that overflow detection would go on to act upon.
+    name: "0001_message_tokens",
+    statements: [
+      `ALTER TABLE message ADD COLUMN tokens_input INTEGER`,
+      `ALTER TABLE message ADD COLUMN tokens_output INTEGER`,
+      `ALTER TABLE message ADD COLUMN tokens_reasoning INTEGER`,
+      `ALTER TABLE message ADD COLUMN tokens_cache_read INTEGER`,
+      `ALTER TABLE message ADD COLUMN tokens_cache_write INTEGER`,
+      `ALTER TABLE message ADD COLUMN tokens_total INTEGER`,
+    ],
+  },
 ]
 
 export function migrate(db: BunDatabase) {

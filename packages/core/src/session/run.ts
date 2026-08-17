@@ -4,6 +4,7 @@ import {
   type Part,
   type SessionID,
   type TextPart,
+  type Tokens,
   type ToolPart,
 } from "@compass/schema"
 import { jsonSchema, streamText, tool as aiTool, type LanguageModel, type ModelMessage, type ToolSet } from "ai"
@@ -11,6 +12,7 @@ import { Context, Data, Effect, Layer } from "effect"
 import { prune } from "../context/pipeline"
 import { describe as describeProviderError } from "../provider/error"
 import { parseModel, resolveModel, type ModelRef } from "../provider/provider"
+import { toTokens } from "../provider/usage"
 import { ToolRegistry } from "../tool/registry"
 import { parameters } from "../tool/tool"
 import { policy, type Attempt } from "./retry"
@@ -194,6 +196,7 @@ export const layerWith = (resolve: ResolveModel) =>
                 onError: () => {},
               })
               let text = ""
+              let tokens: Tokens | undefined
               const calls: { id: string; name: string; input: unknown }[] = []
               for await (const part of result.fullStream) {
                 if (part.type === "text-delta") {
@@ -205,10 +208,18 @@ export const layerWith = (resolve: ResolveModel) =>
                   calls.push({ id: part.toolCallId, name: part.toolName, input: part.input })
                   continue
                 }
+                // The provider's own accounting, and the only trustworthy input
+                // to overflow detection. Read here rather than awaited off the
+                // result promise so a stream that errors partway still leaves
+                // whatever it had reported.
+                if (part.type === "finish") {
+                  tokens = toTokens(part.totalUsage)
+                  continue
+                }
                 if (part.type === "error")
                   throw part.error instanceof Error ? part.error : new Error(String(part.error))
               }
-              return { text, calls }
+              return { text, calls, tokens }
             },
             catch: (cause) => (cause instanceof Error ? cause : new Error(String(cause))),
           }).pipe(
@@ -236,13 +247,15 @@ export const layerWith = (resolve: ResolveModel) =>
             })
           }
 
+          const settled = turn.tokens === undefined ? { id: assistant.id } : { id: assistant.id, tokens: turn.tokens }
+
           if (turn.calls.length === 0) {
-            yield* store.completeMessage({ id: assistant.id })
+            yield* store.completeMessage(settled)
             return false
           }
 
           yield* settleCalls({ ...input, assistantID: assistant.id, calls: turn.calls })
-          yield* store.completeMessage({ id: assistant.id })
+          yield* store.completeMessage(settled)
           return true
         })
 

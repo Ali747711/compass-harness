@@ -28,6 +28,14 @@ export const MessageTable = sqliteTable(
     provider_id: text(),
     model_id: text(),
     error: text(),
+    // Nullable throughout: absent means the provider never reported usage, which
+    // is different from a turn that genuinely used nothing.
+    tokens_input: integer(),
+    tokens_output: integer(),
+    tokens_reasoning: integer(),
+    tokens_cache_read: integer(),
+    tokens_cache_write: integer(),
+    tokens_total: integer(),
   },
   (table) => [index("message_session_idx").on(table.session_id, table.id)],
 )

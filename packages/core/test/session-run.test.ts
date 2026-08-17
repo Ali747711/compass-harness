@@ -62,11 +62,26 @@ function scripted(turns: readonly Chunk[][]) {
   return { model, prompts, turns: () => turn }
 }
 
-const finish: Chunk = {
-  type: "finish",
-  finishReason: "stop",
-  usage: { inputTokens: 1, outputTokens: 1, totalTokens: 2 },
-}
+/**
+ * Provider-level usage is nested (`LanguageModelV3Usage`); the SDK flattens it
+ * into the `inputTokenDetails`/`outputTokenDetails` shape that reaches
+ * `fullStream`. Mock chunks must use the nested form or the flattening throws.
+ */
+const usage = (input: { in?: number; out?: number; cacheRead?: number; cacheWrite?: number; reasoning?: number }) => ({
+  inputTokens: {
+    total: input.in,
+    noCache: input.in === undefined ? undefined : input.in - (input.cacheRead ?? 0) - (input.cacheWrite ?? 0),
+    cacheRead: input.cacheRead,
+    cacheWrite: input.cacheWrite,
+  },
+  outputTokens: {
+    total: input.out,
+    text: input.out === undefined ? undefined : input.out - (input.reasoning ?? 0),
+    reasoning: input.reasoning,
+  },
+})
+
+const finish: Chunk = { type: "finish", finishReason: "stop", usage: usage({ in: 1, out: 1 }) } as Chunk
 
 const text = (value: string): Chunk[] => [
   { type: "text-start", id: "t0" },
@@ -307,6 +322,39 @@ describe("the agent loop", () => {
     expect(history.map((entry) => entry.info.role)).toEqual(["user", "assistant", "user", "assistant"])
     // The second request must include the first exchange.
     expect(JSON.stringify(h.script.prompts[1])).toContain("one")
+    h.cleanup()
+  })
+})
+
+describe("token accounting", () => {
+  test("persists what the provider reported for the turn", async () => {
+    const h = harness([
+      [
+        { type: "text-start", id: "t0" },
+        { type: "text-delta", id: "t0", delta: "hi" },
+        { type: "text-end", id: "t0" },
+        { type: "finish", finishReason: "stop", usage: usage({ in: 9_000, out: 300, cacheRead: 8_000 }) } as Chunk,
+      ],
+    ])
+    const history = await prompt(h, "hi")
+
+    // input is the non-cached remainder; the cached read is carried separately.
+    expect(history[1]!.info.tokens).toMatchObject({ input: 1_000, output: 300, cache: { read: 8_000 } })
+    h.cleanup()
+  })
+
+  test("leaves tokens absent when the provider reported none", async () => {
+    const h = harness([
+      [
+        { type: "text-start", id: "t0" },
+        { type: "text-delta", id: "t0", delta: "hi" },
+        { type: "text-end", id: "t0" },
+        { type: "finish", finishReason: "stop", usage: usage({}) } as Chunk,
+      ],
+    ])
+    const history = await prompt(h, "hi")
+
+    expect(history[1]!.info.tokens).toBeUndefined()
     h.cleanup()
   })
 })
