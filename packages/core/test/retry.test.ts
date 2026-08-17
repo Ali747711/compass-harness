@@ -195,3 +195,47 @@ describe("failures that carry no message", () => {
     expect(classify(quiet).message).toContain("ProviderError")
   })
 })
+
+describe("surfacing what the provider actually said", () => {
+  /**
+   * A 401 and a spent balance both arrive as a 4xx, and only the response body
+   * tells them apart. Collapsing both to "check your key" sends people to
+   * inspect something that was never wrong.
+   */
+  test("prefers the provider's sentence over our generic one", () => {
+    const spent = apiError({
+      statusCode: 400,
+      isRetryable: false,
+      message: "Bad Request",
+      responseBody: JSON.stringify({
+        error: { type: "invalid_request_error", message: "Your credit balance is too low to access the API" },
+      }),
+    })
+    expect(explain(spent).message).toContain("credit balance is too low")
+  })
+
+  test("names the error type when the message does not already", () => {
+    const auth = apiError({
+      statusCode: 401,
+      isRetryable: false,
+      message: "Unauthorized",
+      responseBody: JSON.stringify({ error: { type: "authentication_error", message: "invalid x-api-key" } }),
+    })
+    const explained = explain(auth).message
+    expect(explained).toContain("invalid x-api-key")
+    expect(explained).toContain("authentication_error")
+    // And still says what to do about it.
+    expect(explained).toContain("ANTHROPIC_API_KEY")
+  })
+
+  test("falls back to our own wording when the body says nothing useful", () => {
+    const bare = apiError({ statusCode: 401, isRetryable: false, message: "API key is invalid." })
+    expect(explain(bare).message).toContain("API key is invalid.")
+    expect(explain(bare).message).toContain("ANTHROPIC_API_KEY")
+  })
+
+  test("survives a body that is HTML from a proxy rather than provider JSON", () => {
+    const proxied = apiError({ statusCode: 403, isRetryable: false, message: "Forbidden", responseBody: "<html>" })
+    expect(explain(proxied).message).toContain("Forbidden")
+  })
+})

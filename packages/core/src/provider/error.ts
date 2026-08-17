@@ -78,6 +78,24 @@ export type Classified =
     }
   | { readonly type: "unknown"; readonly message: string }
 
+/**
+ * The provider's own sentence about what went wrong, when it sent one.
+ *
+ * Worth digging out. "API key is invalid" and "your credit balance is too low"
+ * both surface as a 4xx, and only the body distinguishes them — so collapsing
+ * every auth failure to one generic line sends people to check a key that was
+ * never the problem.
+ */
+function providerMessage(body: string | undefined): string | undefined {
+  const parsed = parseBody(body) as { error?: { message?: unknown; type?: unknown } } | undefined
+  const message = parsed?.error?.message
+  if (typeof message !== "string" || message.trim().length === 0) return undefined
+  const type = parsed?.error?.type
+  return typeof type === "string" && !message.toLowerCase().includes(type.toLowerCase())
+    ? `${message} (${type})`
+    : message
+}
+
 function parseBody(value: string | undefined): { error?: { code?: unknown } } | undefined {
   if (typeof value !== "string") return undefined
   try {
@@ -142,11 +160,15 @@ export function describe(cause: unknown): { message: string; status?: number } {
   if (sorted.type !== "api_error") return { message: detail }
 
   const status = sorted.statusCode
+  const upstream = providerMessage(sorted.responseBody)
   if (status === 401 || status === 403)
     return {
-      message: `${detail} Check ANTHROPIC_API_KEY (or OPENAI_API_KEY for an openai/ model).`,
+      // The provider's wording first when we have it, because "invalid x-api-key"
+      // and "your credit balance is too low" call for completely different
+      // actions and both arrive here.
+      message: `${upstream ?? detail} Check ANTHROPIC_API_KEY (or OPENAI_API_KEY for an openai/ model).`,
       ...maybe("status", status),
     }
-  if (status === 429) return { message: `${detail} The provider is rate limiting; retry shortly.`, status }
-  return { message: detail, ...maybe("status", status) }
+  if (status === 429) return { message: `${upstream ?? detail} The provider is rate limiting; retry shortly.`, status }
+  return { message: upstream ?? detail, ...maybe("status", status) }
 }
