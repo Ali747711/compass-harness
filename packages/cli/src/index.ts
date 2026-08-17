@@ -129,6 +129,13 @@ const program = Effect.gen(function* () {
       // Named, not just obeyed. An instruction file you forgot about changing
       // the agent's behaviour is far more confusing than one you can see.
       instructions: (paths) => process.stderr.write(`  ⌸ following ${paths.join(", ")}\n\n`),
+      // A subagent's own output is hidden on purpose, so without this the
+      // terminal shows a long unexplained pause.
+      subagent: (event) => {
+        if (event.state === "started") return process.stderr.write(`\n  ⤷ ${event.agent}: ${event.description}\n`)
+        if (event.state === "working") return process.stderr.write(`    · ${event.tool}\n`)
+        process.stderr.write(`  ⤶ ${event.agent} done\n`)
+      },
       // Also stderr. A retry replays the turn, so whatever the failed attempt
       // already streamed to stdout is about to be said a second time — this
       // line is what makes that legible rather than baffling.

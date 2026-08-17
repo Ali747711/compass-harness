@@ -13,6 +13,7 @@ import { SessionInput, layer as inputLayer } from "../src/session/input"
 import { SessionRun, layerWith, toModelMessages } from "../src/session/run"
 import { SessionStore, layer as storeLayer } from "../src/session/store"
 import { layer as registryLayer } from "../src/tool/registry"
+import { task } from "../src/tool/task"
 import { make as makeTool } from "../src/tool/tool"
 
 /**
@@ -130,7 +131,17 @@ function harness(turns: readonly Chunk[][], override?: MockLanguageModelV4) {
     incomplete: { reason: string; detail: string }[]
     reasoning: string[]
     instructions: string[]
-  } = { text: [], tools: [], retries: [], compactions: [], incomplete: [], reasoning: [], instructions: [] }
+    subagents: { state: string; agent: string; tool?: string }[]
+  } = {
+    text: [],
+    tools: [],
+    retries: [],
+    compactions: [],
+    incomplete: [],
+    reasoning: [],
+    instructions: [],
+    subagents: [],
+  }
   const sink = {
     text: (delta: string) => captured.text.push(delta),
     tool: (event: { name: string; state: string }) => captured.tools.push({ name: event.name, state: event.state }),
@@ -140,12 +151,15 @@ function harness(turns: readonly Chunk[][], override?: MockLanguageModelV4) {
     incomplete: (event: { reason: string; detail: string }) => captured.incomplete.push(event),
     reasoning: (delta: string) => captured.reasoning.push(delta),
     instructions: (paths: readonly string[]) => captured.instructions.push(...paths),
+    subagent: (event: { state: string; agent: string; tool?: string }) => captured.subagents.push(event),
   }
   const layers = layerWith(() => model as never).pipe(
     Layer.provideMerge(
       registryLayer([
         { name: "echo", tool: echo },
         { name: "explode", tool: explode },
+        // Delegation is exercised through the real tool, not a stand-in.
+        { name: "task", tool: task },
       ]),
     ),
     Layer.provideMerge(inputLayer),
@@ -431,6 +445,118 @@ describe("token accounting", () => {
     const history = await prompt(h, "hi")
 
     expect(history[1]!.info.tokens).toBeUndefined()
+    h.cleanup()
+  })
+})
+
+describe("subagents", () => {
+  const delegate = (agent: string) => [
+    {
+      type: "tool-call" as const,
+      toolCallId: "call_1",
+      toolName: "task",
+      input: JSON.stringify({ description: "look something up", prompt: "find X", subagent_type: agent }),
+    },
+    finishWith("tool-calls"),
+  ]
+
+  /**
+   * A subagent is a child Session calling the same drain, so the parent gets
+   * back one answer while the child's working out stays in its own session.
+   */
+  test("delegates to a child session and returns only its answer", async () => {
+    // 1: parent delegates. 2: the child's single turn. 3: parent's reply.
+    const h = harness([delegate("explore"), text("the child's finding"), text("summarised for you")])
+    const history = await prompt(h, "go")
+
+    const toolPart = history.flatMap((e) => e.parts).find((p) => p.type === "tool") as { output?: string }
+    expect(toolPart.output).toBe("the child's finding")
+    expect(h.captured.subagents.map((s) => s.state)).toEqual(["started", "finished"])
+    h.cleanup()
+  })
+
+  test("the child is a real session, recorded with its parent", async () => {
+    const h = harness([delegate("explore"), text("found it"), text("done")])
+    const sessions = await h.run(
+      Effect.gen(function* () {
+        const store = yield* SessionStore
+        const session = yield* store.create({ title: "t", directory: h.directory })
+        const runner = yield* SessionRun
+        yield* runner.prompt({ sessionID: session.id, text: "go", sink: h.sink })
+        return yield* store.list()
+      }),
+    )
+
+    const child = sessions.find((session) => session.parentID !== undefined)
+    expect(child).toBeDefined()
+    expect(child?.title).toBe("look something up")
+    h.cleanup()
+  })
+
+  /** The child's turns are the reason to delegate — they must not reach the parent. */
+  test("the child's intermediate work stays out of the parent's context", async () => {
+    const h = harness([delegate("explore"), text("CHILD-INTERNAL-DETAIL"), text("done")])
+    await prompt(h, "go")
+
+    // The parent's final request carries the tool result, not the child's session.
+    const lastPrompt = JSON.stringify(h.script.prompts.at(-1))
+    expect(lastPrompt).toContain("CHILD-INTERNAL-DETAIL")
+    // ...once, as a tool result — not as a replayed assistant turn.
+    expect(lastPrompt.split("CHILD-INTERNAL-DETAIL").length - 1).toBe(1)
+    h.cleanup()
+  })
+
+  /**
+   * Depth limiting, and the reason it is not just a nicety: without it a
+   * delegating agent that delegates is an unbounded tree.
+   */
+  test("a subagent cannot spawn a subagent", async () => {
+    // 1: parent delegates. 2: the child tries to delegate again — refused.
+    // 3: the child answers anyway. 4: the parent replies.
+    const h = harness([delegate("general"), delegate("general"), text("child gave up"), text("parent done")])
+
+    // One run: layerMemory gives each provide its own database, so reading the
+    // sessions afterwards in a second run would look at an empty one.
+    const { history, all } = await h.run(
+      Effect.gen(function* () {
+        const store = yield* SessionStore
+        const session = yield* store.create({ title: "t", directory: h.directory })
+        const runner = yield* SessionRun
+        yield* runner.prompt({ sessionID: session.id, text: "go", sink: h.sink })
+        const sessions = yield* store.list()
+        return {
+          history: yield* store.messages(session.id),
+          all: yield* Effect.forEach(sessions, (each) => store.messages(each.id)),
+        }
+      }),
+    )
+    const errors = all
+      .flat()
+      .flatMap((entry) => entry.parts)
+      .filter((part) => part.type === "tool" && (part as { state: string }).state === "error")
+      .map((part) => (part as { error?: string }).error)
+
+    expect(errors.some((message) => message?.includes("nests"))).toBe(true)
+    // And the parent still got a usable answer rather than a hang.
+    expect(JSON.stringify(history)).toContain("child gave up")
+    h.cleanup()
+  })
+
+  test("refuses an agent that does not exist, naming the ones that do", async () => {
+    const h = harness([delegate("nonexistent"), text("ok")])
+    const history = await prompt(h, "go")
+
+    const toolPart = history.flatMap((e) => e.parts).find((p) => p.type === "tool") as { error?: string }
+    expect(toolPart.error).toContain("explore")
+    h.cleanup()
+  })
+
+  test("reports a child that produced nothing rather than returning empty", async () => {
+    const h = harness([delegate("explore"), [finishWith("stop")], text("ok")])
+    const history = await prompt(h, "go")
+
+    const toolPart = history.flatMap((e) => e.parts).find((p) => p.type === "tool") as { error?: string }
+    expect(toolPart.error).toContain("returned nothing")
     h.cleanup()
   })
 })

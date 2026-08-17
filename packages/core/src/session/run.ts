@@ -15,12 +15,14 @@ import {
 import { jsonSchema, streamText, tool as aiTool, type LanguageModel, type ModelMessage, type ToolSet } from "ai"
 import { Context, Data, Effect, Layer } from "effect"
 import { prune } from "../context/pipeline"
+import { find as findAgent } from "../agent/agent"
 import { discover, render } from "../instruction/instruction"
 import { Project } from "../project/project"
 import { classify, describe as describeProviderError } from "../provider/error"
 import { modelLimit, parseModel, resolveModel, type ModelRef } from "../provider/provider"
 import { toTokens } from "../provider/usage"
 import { ToolRegistry } from "../tool/registry"
+import { ToolFailure } from "../tool/tool"
 import { parameters } from "../tool/tool"
 import {
   DEFAULT_KEEP_TOKENS,
@@ -54,6 +56,16 @@ export interface Sink {
    */
   /** Which instruction files the session is following. Silent obedience is worse than none. */
   readonly instructions: (paths: readonly string[]) => void
+  /**
+   * A subagent is running. Its own output is deliberately hidden, so without
+   * this the terminal shows a long unexplained pause.
+   */
+  readonly subagent: (event: {
+    readonly state: "started" | "working" | "finished"
+    readonly agent: string
+    readonly description?: string
+    readonly tool?: string
+  }) => void
   readonly reasoning: (delta: string) => void
   readonly retry: (attempt: Attempt) => void
   /**
@@ -151,6 +163,14 @@ function mergeMetadata(
 const errorText = (cause: unknown) =>
   cause instanceof Error ? cause.message : typeof cause === "string" ? cause : "the model sent an unparsable tool call"
 
+/**
+ * How deeply delegation nests. One, matching opencode's default: a subagent
+ * cannot spawn a subagent, so a delegation is bounded work rather than a tree
+ * whose size nobody chose. The `task` permission is force-denied in a child's
+ * derived ruleset for the same reason; this is the second lock on that door.
+ */
+const MAX_SUBAGENT_DEPTH = 1
+
 /** Bounds runaway tool loops. M2 replaces this with a per-agent turn allowance. */
 const MAX_STEPS = 40
 
@@ -168,6 +188,16 @@ const SYSTEM = [
  * override rather than be overridden.
  */
 const systemPrompt = (instructions: string) => (instructions.length === 0 ? SYSTEM : `${SYSTEM}\n\n${instructions}`)
+
+/** Everything a drain needs. Shared by the top-level path and by subagents. */
+interface Turn {
+  readonly sessionID: SessionID
+  readonly directory: string
+  readonly ref: ModelRef
+  readonly sink: Sink
+  readonly abort: AbortSignal
+  readonly instructions: string
+}
 
 interface HistoryEntry {
   readonly info: { readonly role: "user" | "assistant" }
@@ -304,14 +334,7 @@ export const layerWith = (resolve: ResolveModel) =>
         ]),
       )
 
-      const runTurn = (input: {
-        readonly sessionID: SessionID
-        readonly directory: string
-        readonly ref: ModelRef
-        readonly sink: Sink
-        readonly abort: AbortSignal
-        readonly instructions: string
-      }) =>
+      const runTurn = (input: Turn) =>
         Effect.gen(function* () {
           const history = yield* store.messages(input.sessionID)
           const assistant = yield* store.appendMessage({
@@ -560,14 +583,15 @@ export const layerWith = (resolve: ResolveModel) =>
           return incomplete === undefined
         })
 
-      const settleCalls = (input: {
-        readonly abort: AbortSignal
-        readonly sessionID: SessionID
-        readonly directory: string
-        readonly assistantID: MessageID
-        readonly sink: Sink
-        readonly calls: readonly { partID: PartID; id: string; name: string; input: unknown; error?: string }[]
-      }) =>
+      const settleCalls = (
+        input: Turn & {
+          readonly sessionID: SessionID
+          readonly directory: string
+          readonly assistantID: MessageID
+          readonly sink: Sink
+          readonly calls: readonly { partID: PartID; id: string; name: string; input: unknown; error?: string }[]
+        },
+      ) =>
         Effect.forEach(
           input.calls,
           (call) =>
@@ -601,6 +625,9 @@ export const layerWith = (resolve: ResolveModel) =>
                   callID: call.id,
                   directory: input.directory,
                   abort: input.abort,
+                  // Closes over this turn, so a child inherits its directory,
+                  // model and abort signal without any of it being global.
+                  spawn: spawn(input),
                 },
               })
 
@@ -644,12 +671,7 @@ export const layerWith = (resolve: ResolveModel) =>
        * failed compaction must leave the session exactly as it was, because the
        * alternative is losing a conversation in the process of saving it.
        */
-      const compact = (input: {
-        readonly sessionID: SessionID
-        readonly ref: ModelRef
-        readonly sink: Sink
-        readonly abort: AbortSignal
-      }) =>
+      const compact = (input: Omit<Turn, "directory" | "instructions">) =>
         Effect.gen(function* () {
           const history = yield* store.messages(input.sessionID)
           const previous = lastCompaction(history)
@@ -778,6 +800,206 @@ export const layerWith = (resolve: ResolveModel) =>
           yield* store.completeMessage({ id: user.id })
         })
 
+      /**
+       * Works a session until nothing is pending, assuming its prompt is
+       * already admitted.
+       *
+       * Shared by the top-level entrypoint and by subagents, which is the
+       * point: a child session is not a second runtime, it is this one called
+       * again. Compaction, retry, steering and interruption therefore apply to
+       * a subagent by construction rather than by a parallel implementation
+       * somebody has to remember to keep in step.
+       */
+      const drain = (turn: Turn): Effect.Effect<void, ProviderFailure> =>
+        Effect.gen(function* () {
+          // Anything already waiting joins this drain — a steer admitted while
+          // the session was idle should not sit until the next prompt.
+          const initial = yield* inputs.promoteSteers(turn.sessionID, yield* inputs.highWater(turn.sessionID))
+          for (const admitted of initial) yield* materialize(admitted)
+          const first = yield* inputs.promoteNextQueued(turn.sessionID)
+          if (first !== undefined) yield* materialize(first)
+          if (initial.length === 0 && first === undefined) return
+
+          let step = 0
+          let shouldRun = true
+          while (shouldRun) {
+            let needsContinuation = true
+            while (needsContinuation && step < MAX_STEPS) {
+              // Reactive path. The provider is the only authority on what fits, so
+              // an overflow it reports is compacted and the turn retried once.
+              // `retryable` deliberately refuses to retry these, because a plain
+              // retry re-sends the same oversized input — this retries a *smaller*
+              // one, which is a different thing.
+              const outcome = yield* Effect.result(runTurn(turn))
+              // Counted before the recovery branch, and again after it, so both
+              // the failed turn and its retry charge against the cap — otherwise
+              // a session overflowing on every pass gets two turns per iteration
+              // and reaches 2 × MAX_STEPS worth of work.
+              //
+              // Summarizer calls are deliberately NOT charged. The cap bounds
+              // agent steps, not provider calls; charging compaction would give an
+              // overflowing session fewer real steps than a clean one, and in the
+              // recovery branch could trip the break below immediately after
+              // paying for a summary — abandoning the turn having gained nothing.
+              step++
+              if (outcome._tag === "Failure") {
+                const failure = outcome.failure
+                if (failure.overflow !== true || !(yield* compact(turn))) return yield* Effect.fail(failure)
+                if (step >= MAX_STEPS) break
+                needsContinuation = yield* runTurn(turn)
+                step++
+              } else {
+                needsContinuation = outcome.success
+              }
+
+              // Proactive path. Compacting between turns keeps the next request
+              // inside the window instead of discovering the limit by failing.
+              const history = yield* store.messages(turn.sessionID)
+              const tokens = history.at(-1)?.info.tokens
+              if (isOverflow({ tokens, limit: modelLimit(turn.ref) })) yield* compact(turn)
+
+              // A safe turn boundary: the model has finished a thought and no tool
+              // is mid-flight. Steers land here and nowhere else, which is what
+              // makes "actually, use the other file" arrive without interleaving
+              // into a half-finished tool sequence.
+              if (!needsContinuation) {
+                // The cutoff is read here, at the boundary, not before the turn.
+                // Everything admitted while the turn ran belongs to this
+                // boundary; only what lands during promotion itself waits for
+                // the next one, which is what stops a steady stream of steers
+                // from looping here forever. opencode reads its cutoff at the
+                // same instant (runner/llm.ts:188).
+                const cutoff = yield* inputs.highWater(turn.sessionID)
+                const steers = yield* inputs.promoteSteers(turn.sessionID, cutoff)
+                if (steers.length > 0) {
+                  for (const admitted of steers) yield* materialize(admitted)
+                  needsContinuation = true
+                  // New instruction, fresh allowance — a batch resets it once, not
+                  // once per steer, so a burst cannot buy unbounded steps.
+                  step = 0
+                }
+              }
+            }
+
+            // Hitting the cap mid-task looks exactly like finishing: the loop
+            // returns, the CLI exits 0, and the reply simply stops. Say so, the
+            // same way a truncated reply is reported.
+            if (needsContinuation && step >= MAX_STEPS) {
+              turn.sink.incomplete({
+                reason: "step-limit",
+                detail: `the turn reached its limit of ${MAX_STEPS} steps and stopped before finishing`,
+              })
+              return
+            }
+
+            // Idle. Exactly one queued prompt promotes, so a backlog is worked
+            // through one at a time rather than concatenated into a single turn.
+            const next = yield* inputs.promoteNextQueued(turn.sessionID)
+            shouldRun = next !== undefined
+            if (next !== undefined) {
+              yield* materialize(next)
+              step = 0
+            }
+          }
+        })
+
+      /** How deep in the parent chain a session sits. Zero for a top-level one. */
+      const depthOf = (sessionID: SessionID) =>
+        Effect.gen(function* () {
+          let depth = 0
+          let current = yield* store.get(sessionID).pipe(Effect.orDie)
+          while (current.parentID !== undefined && depth <= MAX_SUBAGENT_DEPTH) {
+            depth++
+            current = yield* store.get(current.parentID).pipe(Effect.orDie)
+          }
+          return depth
+        })
+
+      /**
+       * Runs a prompt in a child session and returns its final answer.
+       *
+       * A subagent is a child Session, not a second runtime — it calls the same
+       * drain, writes to the same tables, and is subject to the same retry,
+       * compaction and interruption. The only things that differ are its system
+       * prompt and the fact that its intermediate turns never surface.
+       */
+      const spawn =
+        (parent: Turn) =>
+        (request: { agent: string; description: string; prompt: string }): Effect.Effect<string, ToolFailure> =>
+          Effect.gen(function* () {
+            const depth = yield* depthOf(parent.sessionID)
+            if (depth >= MAX_SUBAGENT_DEPTH) {
+              return yield* new ToolFailure({
+                message: `Delegation only nests ${MAX_SUBAGENT_DEPTH} deep, and this session is already a subagent.`,
+              })
+            }
+
+            const definition = findAgent(parent.directory, request.agent)
+            if (definition === undefined) {
+              return yield* new ToolFailure({ message: `Unknown agent "${request.agent}".` })
+            }
+
+            const child = yield* store.create({
+              title: request.description,
+              directory: parent.directory,
+              parentID: parent.sessionID,
+            })
+            parent.sink.subagent({ state: "started", agent: request.agent, description: request.description })
+
+            yield* inputs.admit({ sessionID: child.id, prompt: { text: request.prompt }, delivery: "queue" })
+
+            // The child streams into its own session, not the parent's terminal.
+            // Hiding that detail is the entire reason to delegate; only tool
+            // activity is surfaced, so the wait is legible.
+            const quiet: Sink = {
+              text: () => {},
+              reasoning: () => {},
+              tool: (event) =>
+                event.state === "pending"
+                  ? parent.sink.subagent({ state: "working", agent: request.agent, tool: event.name })
+                  : undefined,
+              retry: parent.sink.retry,
+              compaction: parent.sink.compaction,
+              incomplete: parent.sink.incomplete,
+              instructions: () => {},
+              subagent: () => {},
+            }
+
+            const outcome = yield* Effect.result(
+              drain({
+                sessionID: child.id,
+                directory: parent.directory,
+                ref: parent.ref,
+                sink: quiet,
+                abort: parent.abort,
+                // The agent's own prompt replaces the primary one; the project's
+                // instructions still apply, since the child works in the same repo.
+                instructions: [definition.prompt, parent.instructions].filter(Boolean).join("\n\n"),
+              }),
+            )
+
+            parent.sink.subagent({ state: "finished", agent: request.agent, description: request.description })
+            if (outcome._tag === "Failure") {
+              return yield* new ToolFailure({
+                message: `The ${request.agent} agent failed: ${outcome.failure.message}`,
+              })
+            }
+
+            // Only the last thing it said. Everything before that is the working
+            // out, which stays on disk and out of the parent's context.
+            const answer = (yield* store.messages(child.id))
+              .filter((entry) => entry.info.role === "assistant")
+              .flatMap((entry) => entry.parts)
+              .filter((part): part is TextPart => part.type === "text")
+              .map((part) => part.text)
+              .at(-1)
+
+            if (answer === undefined || answer.trim().length === 0) {
+              return yield* new ToolFailure({ message: `The ${request.agent} agent returned nothing.` })
+            }
+            return answer
+          })
+
       const prompt: Interface["prompt"] = (input) =>
         Effect.suspend(() => {
           // One controller for the whole drain, created before the body so the
@@ -802,104 +1024,14 @@ export const layerWith = (resolve: ResolveModel) =>
             const files = discover({ directory: session.directory, project: project.directory })
             if (files.length > 0) input.sink.instructions(files.map((file) => file.path))
 
-            const turn = {
+            yield* drain({
               sessionID: input.sessionID,
               directory: session.directory,
               ref,
               sink: input.sink,
               abort: controller.signal,
               instructions: render(files),
-            }
-
-            // Anything already waiting joins this drain — a steer admitted while
-            // the session was idle should not sit until the next prompt.
-            const initial = yield* inputs.promoteSteers(input.sessionID, yield* inputs.highWater(input.sessionID))
-            for (const admitted of initial) yield* materialize(admitted)
-            const first = yield* inputs.promoteNextQueued(input.sessionID)
-            if (first !== undefined) yield* materialize(first)
-            if (initial.length === 0 && first === undefined) return
-
-            let step = 0
-            let shouldRun = true
-            while (shouldRun) {
-              let needsContinuation = true
-              while (needsContinuation && step < MAX_STEPS) {
-                // Reactive path. The provider is the only authority on what fits, so
-                // an overflow it reports is compacted and the turn retried once.
-                // `retryable` deliberately refuses to retry these, because a plain
-                // retry re-sends the same oversized input — this retries a *smaller*
-                // one, which is a different thing.
-                const outcome = yield* Effect.result(runTurn(turn))
-                // Counted before the recovery branch, and again after it, so both
-                // the failed turn and its retry charge against the cap — otherwise
-                // a session overflowing on every pass gets two turns per iteration
-                // and reaches 2 × MAX_STEPS worth of work.
-                //
-                // Summarizer calls are deliberately NOT charged. The cap bounds
-                // agent steps, not provider calls; charging compaction would give an
-                // overflowing session fewer real steps than a clean one, and in the
-                // recovery branch could trip the break below immediately after
-                // paying for a summary — abandoning the turn having gained nothing.
-                step++
-                if (outcome._tag === "Failure") {
-                  const failure = outcome.failure
-                  if (failure.overflow !== true || !(yield* compact(turn))) return yield* Effect.fail(failure)
-                  if (step >= MAX_STEPS) break
-                  needsContinuation = yield* runTurn(turn)
-                  step++
-                } else {
-                  needsContinuation = outcome.success
-                }
-
-                // Proactive path. Compacting between turns keeps the next request
-                // inside the window instead of discovering the limit by failing.
-                const history = yield* store.messages(input.sessionID)
-                const tokens = history.at(-1)?.info.tokens
-                if (isOverflow({ tokens, limit: modelLimit(ref) })) yield* compact(turn)
-
-                // A safe turn boundary: the model has finished a thought and no tool
-                // is mid-flight. Steers land here and nowhere else, which is what
-                // makes "actually, use the other file" arrive without interleaving
-                // into a half-finished tool sequence.
-                if (!needsContinuation) {
-                  // The cutoff is read here, at the boundary, not before the turn.
-                  // Everything admitted while the turn ran belongs to this
-                  // boundary; only what lands during promotion itself waits for
-                  // the next one, which is what stops a steady stream of steers
-                  // from looping here forever. opencode reads its cutoff at the
-                  // same instant (runner/llm.ts:188).
-                  const cutoff = yield* inputs.highWater(input.sessionID)
-                  const steers = yield* inputs.promoteSteers(input.sessionID, cutoff)
-                  if (steers.length > 0) {
-                    for (const admitted of steers) yield* materialize(admitted)
-                    needsContinuation = true
-                    // New instruction, fresh allowance — a batch resets it once, not
-                    // once per steer, so a burst cannot buy unbounded steps.
-                    step = 0
-                  }
-                }
-              }
-
-              // Hitting the cap mid-task looks exactly like finishing: the loop
-              // returns, the CLI exits 0, and the reply simply stops. Say so, the
-              // same way a truncated reply is reported.
-              if (needsContinuation && step >= MAX_STEPS) {
-                input.sink.incomplete({
-                  reason: "step-limit",
-                  detail: `the turn reached its limit of ${MAX_STEPS} steps and stopped before finishing`,
-                })
-                return
-              }
-
-              // Idle. Exactly one queued prompt promotes, so a backlog is worked
-              // through one at a time rather than concatenated into a single turn.
-              const next = yield* inputs.promoteNextQueued(input.sessionID)
-              shouldRun = next !== undefined
-              if (next !== undefined) {
-                yield* materialize(next)
-                step = 0
-              }
-            }
+            })
           }).pipe(
             // Effect can end its own promises on interruption, but a tool already
             // executing is a promise the runtime cannot reach into — bash has a

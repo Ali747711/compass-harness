@@ -3,6 +3,7 @@ import { editTool } from "./edit"
 import { globTool } from "./glob"
 import { grepTool } from "./grep"
 import { readTool } from "./read"
+import { task } from "./task"
 import type { Registration } from "./registry"
 import { writeTool } from "./write"
 
@@ -17,4 +18,6 @@ export const builtins: readonly Registration[] = [
   { name: "bash", tool: bashTool },
   { name: "grep", tool: grepTool },
   { name: "glob", tool: globTool },
+  // Last: delegation is the tool of last resort, after the direct ones.
+  { name: "task", tool: task },
 ]

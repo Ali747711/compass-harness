@@ -23,14 +23,32 @@ import baseline from "./fixtures/tool-descriptions.json"
  */
 const TOOL_DIR = join(import.meta.dir, "..", "src", "tool")
 
+/**
+ * Tools that existed when the baseline was captured. A tool added afterwards
+ * has no "text before the move" and cannot be checked against one — but the
+ * baseline must still account for every tool it does cover, or a rename could
+ * quietly drop a description out of the guarantee.
+ */
+const BASELINED = new Set(Object.keys(baseline))
+
 describe("tool descriptions", () => {
-  test("the baseline covers every registered tool", () => {
-    expect(Object.keys(baseline).sort()).toEqual(builtins.map((entry) => entry.name).sort())
+  test("every baselined tool is still registered under the same name", () => {
+    const registered = new Set(builtins.map((entry) => entry.name))
+    for (const name of BASELINED) expect(registered.has(name), `${name} lost its baseline`).toBe(true)
+  })
+
+  /**
+   * Named explicitly rather than derived, so adding a tool is a deliberate act
+   * that shows up in a diff — not something that silently widens the exemption.
+   */
+  test("only known-new tools are exempt from the byte-identical check", () => {
+    const exempt = builtins.map((entry) => entry.name).filter((name) => !BASELINED.has(name))
+    expect(exempt).toEqual(["task"])
   })
 
   for (const { name, tool } of builtins) {
     describe(name, () => {
-      test("is byte-identical to the text captured before the move", () => {
+      test.if(BASELINED.has(name))("is byte-identical to the text captured before the move", () => {
         expect(tool.description).toBe((baseline as Record<string, string>)[name]!)
       })
 
