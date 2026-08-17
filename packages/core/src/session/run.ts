@@ -7,7 +7,7 @@ import {
   type ToolPart,
 } from "@compass/schema"
 import { jsonSchema, streamText, tool as aiTool, type LanguageModel, type ModelMessage, type ToolSet } from "ai"
-import { Context, Effect, Layer } from "effect"
+import { Context, Data, Effect, Layer } from "effect"
 import { prune } from "../context/pipeline"
 import { parseModel, resolveModel, type ModelRef } from "../provider/provider"
 import { ToolRegistry } from "../tool/registry"
@@ -30,8 +30,34 @@ export interface RunInput {
   readonly sink: Sink
 }
 
+/**
+ * A provider call that failed for a reason the user can act on — a bad key, a
+ * rate limit, a network drop.
+ *
+ * These used to be Effect.orDie, which made them defects. A defect propagates
+ * as a FiberFailure whose message is the entire pretty-printed cause, so an
+ * invalid API key printed a stack trace and the full request body, system
+ * prompt included, instead of one line saying the key was rejected.
+ */
+export class ProviderFailure extends Data.TaggedError("ProviderFailure")<{
+  readonly message: string
+  readonly status?: number
+}> {}
+
 export interface Interface {
-  readonly prompt: (input: RunInput) => Effect.Effect<void>
+  readonly prompt: (input: RunInput) => Effect.Effect<void, ProviderFailure>
+}
+
+/** Pulls the useful line out of an AI SDK error without dragging the request body along. */
+function describeProviderError(cause: unknown): { message: string; status?: number } {
+  const error = cause as { message?: unknown; statusCode?: unknown; name?: unknown }
+  const status = typeof error?.statusCode === "number" ? error.statusCode : undefined
+  const detail = typeof error?.message === "string" ? error.message.split("\n")[0]! : String(cause)
+  if (status === 401 || status === 403) {
+    return { message: `${detail} Check ANTHROPIC_API_KEY (or OPENAI_API_KEY for an openai/ model).`, status }
+  }
+  if (status === 429) return { message: `${detail} The provider is rate limiting; retry shortly.`, status }
+  return status === undefined ? { message: detail } : { message: detail, status }
 }
 
 export class SessionRun extends Context.Service<SessionRun, Interface>()("compass/SessionRun") {}
@@ -44,6 +70,40 @@ export class SessionRun extends Context.Service<SessionRun, Interface>()("compas
  * which would leave the agent loop — the least forgiving code here — untested.
  */
 export type ResolveModel = (ref: ModelRef) => LanguageModel
+
+/**
+ * streamText exposes its results as promise properties. We consume only
+ * fullStream, so on a failed request the other sixteen reject with no handler
+ * attached and the runtime prints the whole cause — request body and system
+ * prompt included — before our own error handling ever runs.
+ */
+const RESULT_PROMISES = [
+  "text",
+  "finishReason",
+  "usage",
+  "totalUsage",
+  "response",
+  "steps",
+  "reasoning",
+  "reasoningText",
+  "content",
+  "warnings",
+  "providerMetadata",
+  "sources",
+  "files",
+  "toolCalls",
+  "toolResults",
+  "request",
+] as const
+
+function silenceUnconsumed(result: object) {
+  for (const key of RESULT_PROMISES) {
+    const value = (result as Record<string, unknown>)[key]
+    if (value && typeof (value as { catch?: unknown }).catch === "function") {
+      void (value as Promise<unknown>).catch(() => {})
+    }
+  }
+}
 
 /** Bounds runaway tool loops. M2 replaces this with a per-agent turn allowance. */
 const MAX_STEPS = 40
@@ -155,6 +215,11 @@ export const layerWith = (resolve: ResolveModel) =>
                 // outside a protected recent window. A no-op under the threshold.
                 messages: prune(toModelMessages(history)).messages,
                 tools: toolSet,
+                // The SDK's default onError is `console.error(error)`, which dumps
+                // the whole cause — request body and system prompt included — to
+                // the terminal. The error is surfaced from fullStream below, so
+                // this replaces a duplicate log rather than swallowing anything.
+                onError: () => {},
               })
               let text = ""
               const calls: { id: string; name: string; input: unknown }[] = []
@@ -176,7 +241,7 @@ export const layerWith = (resolve: ResolveModel) =>
             catch: (cause) => (cause instanceof Error ? cause : new Error(String(cause))),
           }).pipe(
             Effect.tapError((error) => store.completeMessage({ id: assistant.id, error: error.message })),
-            Effect.orDie,
+            Effect.mapError((error) => new ProviderFailure(describeProviderError(error))),
           )
 
           if (turn.text.length > 0) {

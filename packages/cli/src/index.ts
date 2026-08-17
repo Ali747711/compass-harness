@@ -94,7 +94,21 @@ const program = Effect.gen(function* () {
   yield* Spill.sweep(session.directory).pipe(Effect.ignore)
 })
 
+/**
+ * One actionable line, never a stack trace. A tagged failure carries a message
+ * written for the person reading it; anything else is a genuine defect and its
+ * message is the most useful thing we have.
+ */
+function explain(error: unknown) {
+  if (typeof error === "object" && error !== null && "message" in error) {
+    const detail = String((error as { message: unknown }).message)
+    // Effect wraps failures; take the first line so a cause dump never reaches the terminal.
+    return detail.split("\n")[0]!
+  }
+  return String(error)
+}
+
 await Effect.runPromise(program.pipe(Effect.provide(MainLayer), Effect.scoped)).catch((error) => {
-  process.stderr.write(`${error instanceof Error ? error.message : String(error)}\n`)
+  process.stderr.write(`${explain(error)}\n`)
   process.exit(1)
 })
