@@ -46,6 +46,14 @@ export interface Interface {
   readonly promoteSteers: (sessionID: SessionID, cutoff: number) => Effect.Effect<readonly Admitted[]>
   /** Promotes exactly one queued prompt — the oldest. Returns undefined when there is none. */
   readonly promoteNextQueued: (sessionID: SessionID) => Effect.Effect<Admitted | undefined>
+  /**
+   * The highest sequence admitted so far, or 0.
+   *
+   * Snapshotted at the start of a turn and handed back to `promoteSteers` as the
+   * cutoff, so a steer that lands mid-turn waits for the next boundary instead
+   * of joining the one already being assembled.
+   */
+  readonly highWater: (sessionID: SessionID) => Effect.Effect<number>
   readonly find: (id: MessageID) => Effect.Effect<Admitted | undefined>
   readonly list: (sessionID: SessionID) => Effect.Effect<readonly Admitted[]>
 }
@@ -186,6 +194,8 @@ export const layer = Layer.effect(
             ? Effect.succeed(undefined)
             : promote([row], sessionID).pipe(Effect.map((promoted) => promoted.at(0)))
         }),
+
+      highWater: (sessionID) => Effect.sync(() => nextSeq(sessionID) - 1),
 
       find,
 

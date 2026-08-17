@@ -10,11 +10,13 @@ import { LocationServiceMap, at, layer as mapLayer } from "../src/location/servi
 import { layerAllowAll } from "../src/permission/permission"
 import { layer as projectLayer, resolveProject } from "../src/project/project"
 import { SessionRun } from "../src/session/run"
+import { layer as inputLayer } from "../src/session/input"
 import { SessionStore, layer as storeLayer } from "../src/session/store"
 import { ToolRegistry } from "../src/tool/registry"
 
 const Global = mapLayer.pipe(
   Layer.provideMerge(projectLayer),
+  Layer.provideMerge(inputLayer),
   Layer.provideMerge(storeLayer),
   Layer.provideMerge(layerAllowAll),
   Layer.provideMerge(layerMemory),

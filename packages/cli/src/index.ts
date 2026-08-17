@@ -3,6 +3,7 @@ import { SessionID } from "@compass/schema"
 import { layerDefault } from "@compass/core/database/database"
 import { RETRY_MAX_RETRIES } from "@compass/core/session/retry"
 import { SessionRun } from "@compass/core/session/run"
+import { layer as inputLayer } from "@compass/core/session/input"
 import { SessionStore, layer as storeLayer } from "@compass/core/session/store"
 import { at, layer as locationsLayer } from "@compass/core/location/service-map"
 import { Spill } from "@compass/core/tool/spill"
@@ -20,6 +21,7 @@ import { parseArgs } from "node:util"
  */
 const MainLayer = locationsLayer.pipe(
   Layer.provideMerge(projectLayer),
+  Layer.provideMerge(inputLayer),
   Layer.provideMerge(storeLayer),
   Layer.provideMerge(layerAllowAll),
   Layer.provideMerge(layerDefault),

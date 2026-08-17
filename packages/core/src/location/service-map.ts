@@ -1,6 +1,7 @@
 import { Context, Effect, Layer, LayerMap } from "effect"
 import { Permission } from "../permission/permission"
 import { Project } from "../project/project"
+import { SessionInput } from "../session/input"
 import { SessionRun, layer as runLayer } from "../session/run"
 import { SessionStore } from "../session/store"
 import { builtins } from "../tool/builtins"
@@ -9,12 +10,15 @@ import { Location, key, layer as locationLayer, type LocationRef } from "./locat
 
 /**
  * The services that are scoped to one Location. Everything here is rebuilt per
- * project or worktree; everything else (Database, Permission, SessionStore) is
- * global and shared across all of them.
+ * project or worktree; everything else (Database, Permission, SessionStore,
+ * SessionInput) is global and shared across all of them — admitted prompts are
+ * keyed by session, and a session belongs to exactly one Location already.
  */
 export type LocationServices = Location | ToolRegistry | SessionRun
 
-const services = (ref: LocationRef): Layer.Layer<LocationServices, never, Project | SessionStore | Permission> =>
+const services = (
+  ref: LocationRef,
+): Layer.Layer<LocationServices, never, Project | SessionStore | SessionInput | Permission> =>
   runLayer.pipe(Layer.provideMerge(registryLayer(builtins)), Layer.provideMerge(locationLayer(ref)))
 
 export interface Interface {

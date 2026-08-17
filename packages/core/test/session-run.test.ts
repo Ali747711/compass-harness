@@ -8,6 +8,7 @@ import { join } from "node:path"
 import { layerMemory } from "../src/database/database"
 import { layerAllowAll } from "../src/permission/permission"
 import { RETRY_MAX_RETRIES } from "../src/session/retry"
+import { SessionInput, layer as inputLayer } from "../src/session/input"
 import { SessionRun, layerWith, toModelMessages } from "../src/session/run"
 import { SessionStore, layer as storeLayer } from "../src/session/store"
 import { layer as registryLayer } from "../src/tool/registry"
@@ -144,12 +145,13 @@ function harness(turns: readonly Chunk[][], override?: MockLanguageModelV4) {
         { name: "explode", tool: explode },
       ]),
     ),
+    Layer.provideMerge(inputLayer),
     Layer.provideMerge(storeLayer),
     Layer.provideMerge(layerAllowAll),
     Layer.provideMerge(layerMemory),
   )
 
-  const run = <A, E>(effect: Effect.Effect<A, E, SessionRun | SessionStore>) =>
+  const run = <A, E>(effect: Effect.Effect<A, E, SessionRun | SessionStore | SessionInput>) =>
     Effect.runPromise(effect.pipe(Effect.provide(layers), Effect.scoped) as Effect.Effect<A, E>)
 
   return { script, directory, captured, sink, run, cleanup: () => rmSync(directory, { recursive: true, force: true }) }
@@ -425,6 +427,141 @@ describe("token accounting", () => {
     const history = await prompt(h, "hi")
 
     expect(history[1]!.info.tokens).toBeUndefined()
+    h.cleanup()
+  })
+})
+
+describe("the drain loop", () => {
+  /** Admission is durable and precedes execution — the record outlives the process. */
+  test("records the prompt before calling the provider", async () => {
+    const h = harness([text("ok")])
+    const seen = await h.run(
+      Effect.gen(function* () {
+        const store = yield* SessionStore
+        const inputs = yield* SessionInput
+        const session = yield* store.create({ title: "t", directory: h.directory })
+        const runner = yield* SessionRun
+        yield* runner.prompt({ sessionID: session.id, text: "remember", sink: h.sink })
+        return yield* inputs.list(session.id)
+      }),
+    )
+    expect(seen.map((entry) => entry.prompt.text)).toEqual(["remember"])
+    // Promoted, not merely admitted.
+    expect(seen[0]!.promotedSeq).toBeDefined()
+  })
+
+  /**
+   * The distinction the whole design exists for. A steer redirects work already
+   * in flight; it must land at a turn boundary, not be swallowed or deferred to
+   * the next prompt.
+   */
+  test("a steer admitted mid-drain lands at the next boundary and continues the turn", async () => {
+    // The steer is admitted from inside the model call — i.e. genuinely while
+    // the session is working — which is the only case the boundary logic exists
+    // for. Admitting before prompt() would merely test the idle path.
+    let admit: (() => Promise<unknown>) | undefined
+    let call = 0
+    const doStream = (async () => {
+      call++
+      if (call === 1 && admit) await admit()
+      const chunks = call === 1 ? text("first answer") : text("after the steer")
+      return { stream: simulateReadableStream({ chunks, initialDelayInMs: 0, chunkDelayInMs: 0 }) }
+    }) as never
+    const h = harness([], new MockLanguageModelV4({ doStream }))
+
+    const history = await h.run(
+      Effect.gen(function* () {
+        const store = yield* SessionStore
+        const inputs = yield* SessionInput
+        const session = yield* store.create({ title: "t", directory: h.directory })
+        const runner = yield* SessionRun
+        admit = () =>
+          Effect.runPromise(inputs.admit({ sessionID: session.id, prompt: { text: "STEERED" }, delivery: "steer" }))
+        yield* runner.prompt({ sessionID: session.id, text: "original", sink: h.sink })
+        return yield* store.messages(session.id)
+      }),
+    )
+
+    const users = history
+      .filter((entry) => entry.info.role === "user")
+      .map((entry) => (entry.parts[0] as { text: string }).text)
+    // The steer arrives after the turn it interrupted, not before it.
+    expect(users).toEqual(["original", "STEERED"])
+    // The drain continued rather than returning at the end of the first turn.
+    expect(call).toBe(2)
+    expect(JSON.stringify(history)).toContain("after the steer")
+    h.cleanup()
+  })
+
+  test("a turn with no steer pending stops at its boundary", async () => {
+    const h = harness([text("just this")])
+    await prompt(h, "go")
+    expect(h.script.turns()).toBe(1)
+    h.cleanup()
+  })
+
+  /** Exactly one queued prompt per idle, so a backlog is worked through in order. */
+  test("works a queued backlog one prompt at a time", async () => {
+    const h = harness([text("answer")])
+    const history = await h.run(
+      Effect.gen(function* () {
+        const store = yield* SessionStore
+        const inputs = yield* SessionInput
+        const session = yield* store.create({ title: "t", directory: h.directory })
+        const runner = yield* SessionRun
+        yield* inputs.admit({ sessionID: session.id, prompt: { text: "second" }, delivery: "queue" })
+        yield* inputs.admit({ sessionID: session.id, prompt: { text: "third" }, delivery: "queue" })
+        yield* runner.prompt({ sessionID: session.id, text: "first", sink: h.sink })
+        return yield* store.messages(session.id)
+      }),
+    )
+
+    const users = history
+      .filter((entry) => entry.info.role === "user")
+      .map((entry) => (entry.parts[0] as { text: string }).text)
+    // All three drained, oldest first, each getting its own turn.
+    expect(users).toEqual(["second", "third", "first"])
+    expect(history.filter((entry) => entry.info.role === "assistant").length).toBe(3)
+    h.cleanup()
+  })
+
+  test("leaves nothing pending once the drain returns", async () => {
+    const h = harness([text("done")])
+    const pending = await h.run(
+      Effect.gen(function* () {
+        const store = yield* SessionStore
+        const inputs = yield* SessionInput
+        const session = yield* store.create({ title: "t", directory: h.directory })
+        const runner = yield* SessionRun
+        yield* inputs.admit({ sessionID: session.id, prompt: { text: "q" }, delivery: "queue" })
+        yield* inputs.admit({ sessionID: session.id, prompt: { text: "s" }, delivery: "steer" })
+        yield* runner.prompt({ sessionID: session.id, text: "go", sink: h.sink })
+        return {
+          steer: yield* inputs.hasPending(session.id, "steer"),
+          queue: yield* inputs.hasPending(session.id, "queue"),
+        }
+      }),
+    )
+    expect(pending).toEqual({ steer: false, queue: false })
+    h.cleanup()
+  })
+
+  /** The admitted record and the conversation entry are one thing, not two rows to reconcile. */
+  test("the user message keeps the admitted prompt's identity", async () => {
+    const h = harness([text("ok")])
+    const result = await h.run(
+      Effect.gen(function* () {
+        const store = yield* SessionStore
+        const inputs = yield* SessionInput
+        const session = yield* store.create({ title: "t", directory: h.directory })
+        const runner = yield* SessionRun
+        yield* runner.prompt({ sessionID: session.id, text: "hi", sink: h.sink })
+        const admitted = yield* inputs.list(session.id)
+        const history = yield* store.messages(session.id)
+        return { admittedID: admitted[0]!.id, messageID: history[0]!.info.id }
+      }),
+    )
+    expect(result.messageID).toBe(result.admittedID)
     h.cleanup()
   })
 })
@@ -785,6 +922,7 @@ describe("interrupted tool calls", () => {
     const h = harness([callTool("hang", {}), text("after")])
     const layers = layerWith(() => h.script.model as never).pipe(
       Layer.provideMerge(registryLayer([{ name: "hang", tool: hang }])),
+      Layer.provideMerge(inputLayer),
       Layer.provideMerge(storeLayer),
       Layer.provideMerge(layerAllowAll),
       Layer.provideMerge(layerMemory),

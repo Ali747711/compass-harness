@@ -30,6 +30,8 @@ export interface Interface {
     role: Message["role"]
     providerID?: string
     modelID?: string
+    /** Supplied when the message already has an identity — an admitted prompt keeps its own. */
+    id?: MessageID
   }) => Effect.Effect<Message>
   readonly completeMessage: (input: {
     id: MessageID
@@ -128,7 +130,7 @@ export const layer = Layer.effect(
       appendMessage: (input) =>
         Effect.sync(() => {
           const message: Message = {
-            id: newMessageID(),
+            id: input.id ?? newMessageID(),
             sessionID: input.sessionID,
             role: input.role,
             timeCreated: Date.now(),

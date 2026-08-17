@@ -1,6 +1,8 @@
 import {
   INCOMPLETE_FINISH,
   partID as newPartID,
+  type Admitted,
+  type Delivery,
   type CompactionPart,
   type PartID,
   type MessageID,
@@ -26,6 +28,7 @@ import {
   select,
   summaryFits,
 } from "./compaction"
+import { SessionInput } from "./input"
 import { isOverflow } from "./overflow"
 import { policy, type Attempt } from "./retry"
 import { SessionStore } from "./store"
@@ -71,6 +74,11 @@ export interface RunInput {
   readonly text: string
   readonly model?: string
   readonly sink: Sink
+  /**
+   * When this prompt reaches the model. Defaults to `queue`, which is right for
+   * a fresh ask; `steer` is for redirecting work already in flight.
+   */
+  readonly delivery?: Delivery
 }
 
 /**
@@ -260,6 +268,7 @@ export const layerWith = (resolve: ResolveModel) =>
     SessionRun,
     Effect.gen(function* () {
       const store = yield* SessionStore
+      const inputs = yield* SessionInput
       const registry = yield* ToolRegistry
 
       /**
@@ -680,70 +689,133 @@ export const layerWith = (resolve: ResolveModel) =>
           return true
         })
 
+      /**
+       * Turns a promoted prompt into a user message the model will see.
+       *
+       * The admitted record keeps its own id and the message adopts it, so the
+       * durable prompt and the conversation entry are the same thing rather than
+       * two rows that have to be kept in agreement.
+       */
+      const materialize = (admitted: Admitted) =>
+        Effect.gen(function* () {
+          const user = yield* store.appendMessage({
+            sessionID: admitted.sessionID,
+            role: "user",
+            id: admitted.id,
+          })
+          yield* store.putPart({
+            id: newPartID(),
+            messageID: user.id,
+            sessionID: admitted.sessionID,
+            type: "text",
+            text: admitted.prompt.text,
+          })
+          yield* store.completeMessage({ id: user.id })
+        })
+
       const prompt: Interface["prompt"] = (input) =>
         Effect.gen(function* () {
           const session = yield* store.get(input.sessionID).pipe(Effect.orDie)
           const ref = parseModel(input.model)
 
-          // Persisted before any provider work, so a crash cannot lose the ask.
-          // M2 turns this into durable admission with steer/queue delivery.
-          const user = yield* store.appendMessage({ sessionID: input.sessionID, role: "user" })
-          yield* store.putPart({
-            id: newPartID(),
-            messageID: user.id,
+          // Durable first, executed second. A crash between these two loses
+          // nothing: the prompt is on disk and the next drain picks it up.
+          yield* inputs.admit({
             sessionID: input.sessionID,
-            type: "text",
-            text: input.text,
+            prompt: { text: input.text, ...(input.model === undefined ? {} : { model: input.model }) },
+            delivery: input.delivery ?? "queue",
           })
-          yield* store.completeMessage({ id: user.id })
 
           const turn = { sessionID: input.sessionID, directory: session.directory, ref, sink: input.sink }
 
+          // Anything already waiting joins this drain — a steer admitted while
+          // the session was idle should not sit until the next prompt.
+          const initial = yield* inputs.promoteSteers(input.sessionID, yield* inputs.highWater(input.sessionID))
+          for (const admitted of initial) yield* materialize(admitted)
+          const first = yield* inputs.promoteNextQueued(input.sessionID)
+          if (first !== undefined) yield* materialize(first)
+          if (initial.length === 0 && first === undefined) return
+
           let step = 0
-          let needsContinuation = true
-          while (needsContinuation && step < MAX_STEPS) {
-            // Reactive path. The provider is the only authority on what fits, so
-            // an overflow it reports is compacted and the turn retried once.
-            // `retryable` deliberately refuses to retry these, because a plain
-            // retry re-sends the same oversized input — this retries a *smaller*
-            // one, which is a different thing.
-            const outcome = yield* Effect.result(runTurn(turn))
-            // Counted before the recovery branch, and again after it, so both
-            // the failed turn and its retry charge against the cap — otherwise
-            // a session overflowing on every pass gets two turns per iteration
-            // and reaches 2 × MAX_STEPS worth of work.
-            //
-            // Summarizer calls are deliberately NOT charged. The cap bounds
-            // agent steps, not provider calls; charging compaction would give an
-            // overflowing session fewer real steps than a clean one, and in the
-            // recovery branch could trip the break below immediately after
-            // paying for a summary — abandoning the turn having gained nothing.
-            step++
-            if (outcome._tag === "Failure") {
-              const failure = outcome.failure
-              if (failure.overflow !== true || !(yield* compact(turn))) return yield* Effect.fail(failure)
-              if (step >= MAX_STEPS) break
-              needsContinuation = yield* runTurn(turn)
+          let shouldRun = true
+          while (shouldRun) {
+            let needsContinuation = true
+            while (needsContinuation && step < MAX_STEPS) {
+              // Reactive path. The provider is the only authority on what fits, so
+              // an overflow it reports is compacted and the turn retried once.
+              // `retryable` deliberately refuses to retry these, because a plain
+              // retry re-sends the same oversized input — this retries a *smaller*
+              // one, which is a different thing.
+              const outcome = yield* Effect.result(runTurn(turn))
+              // Counted before the recovery branch, and again after it, so both
+              // the failed turn and its retry charge against the cap — otherwise
+              // a session overflowing on every pass gets two turns per iteration
+              // and reaches 2 × MAX_STEPS worth of work.
+              //
+              // Summarizer calls are deliberately NOT charged. The cap bounds
+              // agent steps, not provider calls; charging compaction would give an
+              // overflowing session fewer real steps than a clean one, and in the
+              // recovery branch could trip the break below immediately after
+              // paying for a summary — abandoning the turn having gained nothing.
               step++
-            } else {
-              needsContinuation = outcome.success
+              if (outcome._tag === "Failure") {
+                const failure = outcome.failure
+                if (failure.overflow !== true || !(yield* compact(turn))) return yield* Effect.fail(failure)
+                if (step >= MAX_STEPS) break
+                needsContinuation = yield* runTurn(turn)
+                step++
+              } else {
+                needsContinuation = outcome.success
+              }
+
+              // Proactive path. Compacting between turns keeps the next request
+              // inside the window instead of discovering the limit by failing.
+              const history = yield* store.messages(input.sessionID)
+              const tokens = history.at(-1)?.info.tokens
+              if (isOverflow({ tokens, limit: modelLimit(ref) })) yield* compact(turn)
+
+              // A safe turn boundary: the model has finished a thought and no tool
+              // is mid-flight. Steers land here and nowhere else, which is what
+              // makes "actually, use the other file" arrive without interleaving
+              // into a half-finished tool sequence.
+              if (!needsContinuation) {
+                // The cutoff is read here, at the boundary, not before the turn.
+                // Everything admitted while the turn ran belongs to this
+                // boundary; only what lands during promotion itself waits for
+                // the next one, which is what stops a steady stream of steers
+                // from looping here forever. opencode reads its cutoff at the
+                // same instant (runner/llm.ts:188).
+                const cutoff = yield* inputs.highWater(input.sessionID)
+                const steers = yield* inputs.promoteSteers(input.sessionID, cutoff)
+                if (steers.length > 0) {
+                  for (const admitted of steers) yield* materialize(admitted)
+                  needsContinuation = true
+                  // New instruction, fresh allowance — a batch resets it once, not
+                  // once per steer, so a burst cannot buy unbounded steps.
+                  step = 0
+                }
+              }
             }
 
-            // Proactive path. Compacting between turns keeps the next request
-            // inside the window instead of discovering the limit by failing.
-            const history = yield* store.messages(input.sessionID)
-            const tokens = history.at(-1)?.info.tokens
-            if (isOverflow({ tokens, limit: modelLimit(ref) })) yield* compact(turn)
-          }
+            // Hitting the cap mid-task looks exactly like finishing: the loop
+            // returns, the CLI exits 0, and the reply simply stops. Say so, the
+            // same way a truncated reply is reported.
+            if (needsContinuation && step >= MAX_STEPS) {
+              input.sink.incomplete({
+                reason: "step-limit",
+                detail: `the turn reached its limit of ${MAX_STEPS} steps and stopped before finishing`,
+              })
+              return
+            }
 
-          // Hitting the cap mid-task looks exactly like finishing: the loop
-          // returns, the CLI exits 0, and the reply simply stops. Say so, the
-          // same way a truncated reply is reported.
-          if (needsContinuation && step >= MAX_STEPS) {
-            input.sink.incomplete({
-              reason: "step-limit",
-              detail: `the turn reached its limit of ${MAX_STEPS} steps and stopped before finishing`,
-            })
+            // Idle. Exactly one queued prompt promotes, so a backlog is worked
+            // through one at a time rather than concatenated into a single turn.
+            const next = yield* inputs.promoteNextQueued(input.sessionID)
+            shouldRun = next !== undefined
+            if (next !== undefined) {
+              yield* materialize(next)
+              step = 0
+            }
           }
         })
 
