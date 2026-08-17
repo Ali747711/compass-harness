@@ -1,0 +1,25 @@
+Launch a new agent to handle a complex, multi-step task autonomously.
+
+Specify a subagent_type to choose which agent to delegate to. The available agents and what
+each is for are listed in the parameter description.
+
+When NOT to use this tool:
+- To read a specific file, use read or glob — going through an agent is slower and less direct
+- To find a specific definition like "class Foo", use grep
+- To search within two or three known files, use read
+- If no available agent fits the task, use the other tools directly
+
+Usage notes:
+1. Launch several agents at once when the work divides cleanly, by issuing multiple tool calls in
+   a single message.
+2. Once you have delegated something, do not also do it yourself. Move on to work that does not
+   overlap, or wait for the result.
+3. The agent returns a single message. Its intermediate work stays in its own session and never
+   enters this conversation — that is the point of delegating. The result is not shown to the
+   user, so summarise anything they need to know.
+4. The agent starts with no knowledge of this conversation. Your prompt must be self-contained:
+   state the task in full, and say exactly what you want back.
+5. Say plainly whether the agent should change code or only investigate. It cannot infer the
+   user's intent. Where it applies, tell it how to verify its work — the test command, for
+   instance.
+6. Trust what the agent reports, but remember it only knows what you told it.

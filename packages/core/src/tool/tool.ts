@@ -18,6 +18,20 @@ export interface Context {
   readonly callID: string
   readonly directory: string
   readonly abort: AbortSignal
+  /**
+   * Runs a prompt in a child session and returns its answer.
+   *
+   * Travels on the call context rather than through a service because the
+   * runner is what supplies it, and the runner already depends on the tool
+   * registry — a `task` tool that depended on the runner would close that loop.
+   * Absent when no runner is present, which is why it is optional: a tool test
+   * builds a context by hand and has nothing to spawn into.
+   */
+  readonly spawn?: (input: {
+    readonly agent: string
+    readonly description: string
+    readonly prompt: string
+  }) => Effect.Effect<string, ToolFailure>
 }
 
 export class ToolFailure extends Data.TaggedError("ToolFailure")<{ readonly message: string }> {}
